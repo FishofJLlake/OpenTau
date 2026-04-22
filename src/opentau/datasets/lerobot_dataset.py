@@ -1874,6 +1874,7 @@ class LeRobotDataset(BaseDataset):
         pix_fmt: str = "yuv420p",
         g: int | None = 2,
         crf: int | None = 30,
+        start_time: float | None = None,
     ) -> Path:
         """Attach a pre-recorded MP4 video to an episode with deferred video observations.
 
@@ -1898,6 +1899,9 @@ class LeRobotDataset(BaseDataset):
             pix_fmt: Pixel format. Defaults to "yuv420p".
             g: GOP size. Defaults to 2.
             crf: Constant Rate Factor. Defaults to 30.
+            start_time: Optional start offset in seconds into the source video.
+                Useful when only a portion of the recording overlaps with the
+                episode data. Defaults to None (start from the beginning).
 
         Returns:
             Path to the written video file inside the dataset.
@@ -1936,6 +1940,7 @@ class LeRobotDataset(BaseDataset):
             g=g,
             crf=crf,
             overwrite=overwrite,
+            start_time=start_time,
         )
 
         logging.info(

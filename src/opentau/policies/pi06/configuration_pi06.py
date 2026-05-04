@@ -71,7 +71,10 @@ class PI06Config(PreTrainedConfig):
         dropout: Dropout rate. Defaults to 0.1.
         num_steps: Number of flow matching denoising steps. Defaults to 5
             (halved from π0.5's 10, giving ~63 ms per chunk on an H100).
-        attention_implementation: "eager" or "fa2". Defaults to "eager".
+        attention_implementation: "eager", "sdpa", or "fa2". Defaults to "eager".
+            "sdpa" dispatches to ``torch.nn.functional.scaled_dot_product_attention``
+            (typically 2-3x faster on A100 + bf16). "fa2" is accepted for backward
+            compatibility but logs a warning and falls back to eager.
         freeze_vision_encoder: Whether to freeze the vision encoder. Defaults to True.
         train_expert_only: Whether to train only the expert module. Defaults to False.
         optimizer_lr: AdamW learning rate. Defaults to 2.5e-5.
@@ -136,6 +139,17 @@ class PI06Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
+
+    # Wrap each interleaved transformer-layer forward in torch.utils.checkpoint
+    # to trade ~25-33% same-batch compute for a large slice of activation memory
+    # per rank, typically netting +10-25% throughput once the freed memory is
+    # spent on a larger per-rank batch. Only supported with distributed_type=
+    # MULTI_GPU (DDP), NO (single process), or DeepSpeed ZeRO-1/2 — src/opentau/
+    # scripts/train.py raises if the accelerator's distributed_type is anything
+    # else (ZeRO-3, FSDP) because pi06's custom interleaved per-layer forward
+    # does not wire up the backend-specific activation-checkpointing hooks
+    # those strategies require. Defaults to False (no ckpt, lowest risk).
+    gradient_checkpointing: bool = False
 
     # Training presets
     optimizer_lr: float = 2.5e-5

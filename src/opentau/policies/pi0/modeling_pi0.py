@@ -587,6 +587,7 @@ class PI0FlowMatching(nn.Module):
             train_expert_only=self.config.train_expert_only,
             attention_implementation=self.config.attention_implementation,
             dropout=self.config.dropout,
+            gradient_checkpointing=self.config.gradient_checkpointing,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
 

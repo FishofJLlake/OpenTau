@@ -42,6 +42,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
+from opentau.datasets.grounding.tokenizer_utils import ensure_loc_tokens
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.pi06.configuration_pi06 import PI06Config
 from opentau.policies.pi06.gemma3_with_expert import (
@@ -281,16 +282,24 @@ class PI06Policy(PreTrainedPolicy):
             config.output_features, config.normalization_mapping, dataset_stats
         )
 
-        # π0.6 uses Gemma 3's tokenizer. We fall back to the paligemma tokenizer
-        # only if the Hub download fails at module import time in an offline CI,
-        # so users still get a useful error rather than silent drift.
+        # π0.6 uses Gemma 3's tokenizer. The same instance is shared with the
+        # inner `PI06FlowMatching` so vocab extension happens exactly once and
+        # token IDs cannot drift between the two layers (e.g. if anyone
+        # introduces a non-deterministic adder, two independent loads at
+        # different revisions, or reorders the calls). The single
+        # `ensure_loc_tokens` call inside the inner ctor extends both this
+        # tokenizer and resizes the model embeddings together.
         self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
 
         self.discrete_action_processor = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
-        self.model = PI06FlowMatching(config, discrete_action_vocab_size=discrete_action_vocab_size)
+        self.model = PI06FlowMatching(
+            config,
+            discrete_action_vocab_size=discrete_action_vocab_size,
+            language_tokenizer=self.language_tokenizer,
+        )
 
         self.reset()
 
@@ -746,12 +755,22 @@ class PI06FlowMatching(nn.Module):
     └──────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI06Config, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self,
+        config: PI06Config,
+        discrete_action_vocab_size: int | None = None,
+        language_tokenizer: AutoTokenizer | None = None,
+    ):
         """Initializes the PI06FlowMatching model.
 
         Args:
             config: `PI06Config` instance.
             discrete_action_vocab_size: FAST tokenizer vocabulary size.
+            language_tokenizer: Optional pre-loaded Gemma 3 tokenizer to share
+                with the enclosing `PI06Policy`. When ``None`` (e.g. unit tests
+                that construct the inner module directly) the tokenizer is
+                loaded here. Either way, the same instance is used by both
+                layers — there is no second copy to fall out of sync.
         """
         super().__init__()
         self.config = config
@@ -772,7 +791,20 @@ class PI06FlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
-        self.language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+        if language_tokenizer is None:
+            language_tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-4b-pt")
+        self.language_tokenizer = language_tokenizer
+        # π0.6 uses Gemma 3, whose stock tokenizer does NOT carry the 1024
+        # <loc0000>..<loc1023> grounding tokens that PaliGemma reserves. We
+        # unconditionally extend the vocab here so any grounding/VQA training
+        # data containing loc tokens flows through the same response_ce_loss
+        # path as on PaliGemma backbones. The new embedding rows are random-
+        # init under a forked, fixed-seed RNG (see `ensure_loc_tokens`); there
+        # is NO PaliGemma loc-embedding transfer. The resize must happen after
+        # `Gemma3WithExpertModel(...)` has already loaded the public Gemma 3
+        # weights (above), so the original 256K rows survive and only the 1024
+        # new rows are freshly initialized.
+        ensure_loc_tokens(self.language_tokenizer, model=self.gemma3_with_expert.gemma3)
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Standard Gaussian noise (float32)."""

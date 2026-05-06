@@ -1,0 +1,33 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+downcast_bf16: 'no'
+mixed_precision: bf16
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # InterleavedDecoderLayer bundles one Gemma3 backbone layer + one Gemma-v1
+  # expert layer into a single nn.Module — the FSDP wrap target. Wrapping at
+  # this granularity is what makes pi07 work under FSDP / ZeRO-3: the
+  # all-gather hook fires on the bundled forward, prefetching every
+  # sub-component (input_layernorm, self_attn.{q,k,v}_proj, mlp, ...) at
+  # once. Wrapping at the inner Gemma3DecoderLayer / GemmaDecoderLayer level
+  # would re-introduce the sub-component access bug.
+  fsdp_transformer_layer_cls_to_wrap: InterleavedDecoderLayer,SiglipEncoderLayer
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_use_orig_params: true
+  fsdp_sync_module_states: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: false
+  fsdp_forward_prefetch: true
+  fsdp_backward_prefetch: BACKWARD_PRE

@@ -20,7 +20,7 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pprint import pformat
 from typing import Any
 
@@ -190,6 +190,54 @@ def _find_unused_params_from_env() -> bool:
     return os.environ.get("FIND_UNUSED_PARAMS", "true").lower() == "true"
 
 
+@contextmanager
+def _zero3_disabled_init_context(accelerator: accelerate.Accelerator):
+    """Context manager that suppresses ZeRO-3 per-construction param partitioning.
+
+    Under DeepSpeed ZeRO-3, transformers' `is_deepspeed_zero3_enabled()` flag
+    routes module construction through DeepSpeed's `partition_parameters`
+    wrapper, which shards each parameter as it's created. Several init
+    paths in our model graph need the full tensor shape and crash on the
+    per-rank shard — concretely, transformers' SigLIP `_init_weights`
+    calls `lecun_normal_` → `_calculate_fan_in_and_fan_out`, which raises
+    on a 0-D shard.
+
+    The accelerate yaml field `zero3_init_flag: false` only controls
+    transformers' `from_pretrained` integration, NOT the partitioning
+    wrapper that fires on plain `__init__`. To suppress the wrapper for a
+    bounded section we have to unset the active `HfDeepSpeedConfig` directly.
+
+    On entry: if the active backend is DeepSpeed ZeRO-3, save and clear the
+    HF-side DeepSpeed config so `is_deepspeed_zero3_enabled()` returns False.
+    On exit: restore it. ZeRO-3 itself still partitions the params correctly
+    when `accelerator.prepare` later wraps the model.
+
+    Args:
+        accelerator: The active accelerate ``Accelerator``.
+    """
+    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+        yield
+        return
+    zero_stage = accelerator.deepspeed_plugin.hf_ds_config.config.get("zero_optimization", {}).get("stage", 0)
+    if zero_stage < 3:
+        yield
+        return
+
+    from transformers.integrations.deepspeed import (
+        is_deepspeed_zero3_enabled,
+        set_hf_deepspeed_config,
+        unset_hf_deepspeed_config,
+    )
+
+    saved_hf_ds_config = accelerator.deepspeed_plugin.hf_ds_config if is_deepspeed_zero3_enabled() else None
+    try:
+        unset_hf_deepspeed_config()
+        yield
+    finally:
+        if saved_hf_ds_config is not None:
+            set_hf_deepspeed_config(saved_hf_ds_config)
+
+
 def _sync_deepspeed_gradient_accumulation_steps(
     accelerator: accelerate.Accelerator, cfg: TrainPipelineConfig
 ) -> None:
@@ -244,27 +292,26 @@ def train(cfg: TrainPipelineConfig):
     _sync_deepspeed_gradient_accumulation_steps(accelerator, cfg)
 
     # Strict guard for gradient_checkpointing: the pi05 custom forward loop
-    # wraps layer bodies in torch.utils.checkpoint.checkpoint, which is only
-    # semantically safe under distributed backends that do NOT re-shard
-    # parameters during forward. DDP (MULTI_GPU), single-process (NO), and
-    # DeepSpeed ZeRO-1/2 all replicate full params on every rank during
-    # forward — safe. ZeRO-3 and FSDP re-shard and rely on forward-time
-    # all-gather hooks that plain torch.utils.checkpoint does not trigger
-    # during backward recompute, which can silently produce wrong gradients
-    # or hang. Fail loudly at startup instead of corrupting training.
+    # wraps layer bodies in torch.utils.checkpoint.checkpoint. With
+    # use_reentrant=False this uses saved_tensors_hooks, which co-exist
+    # with FSDP's all-gather hooks in PyTorch ≥2.4 — so FSDP is supported.
+    # DeepSpeed ZeRO-3, however, prefetches/re-shards through DeepSpeed-specific
+    # hooks that torch.utils.checkpoint does not fire, so it can silently
+    # produce wrong gradients; keep that case rejected.
     if getattr(cfg.policy, "gradient_checkpointing", False):
         grad_ckpt_allowed = {
             accelerate.DistributedType.MULTI_GPU,
             accelerate.DistributedType.NO,
             accelerate.DistributedType.DEEPSPEED,
+            accelerate.DistributedType.FSDP,
         }
         if accelerator.distributed_type not in grad_ckpt_allowed:
             raise ValueError(
                 f"gradient_checkpointing=True is not supported under "
                 f"distributed_type={accelerator.distributed_type}. Supported: "
-                "MULTI_GPU (DDP), NO (single process), DEEPSPEED (ZeRO-1/2 only). "
-                "ZeRO-3 and FSDP need backend-specific activation-checkpointing "
-                "hooks which pi05's custom per-layer forward does not wire up. "
+                "MULTI_GPU (DDP), NO (single process), FSDP, DEEPSPEED (ZeRO-1/2 only). "
+                "DeepSpeed ZeRO-3 needs deepspeed.checkpointing.checkpoint hooks "
+                "which pi05's custom per-layer forward does not wire up. "
                 "Either set gradient_checkpointing=False or switch to a "
                 "supported backend."
             )
@@ -278,7 +325,9 @@ def train(cfg: TrainPipelineConfig):
                     f"DeepSpeed ZeRO stage {zero_stage}. ZeRO-3 re-shards parameters "
                     "during forward and needs deepspeed.checkpointing.checkpoint "
                     "rather than torch.utils.checkpoint. Either set "
-                    "gradient_checkpointing=False or use zero_stage: 1 or 2."
+                    "gradient_checkpointing=False, use zero_stage: 1 or 2, or "
+                    "switch to FSDP (which has equivalent param sharding and "
+                    "is compatible with torch.utils.checkpoint)."
                 )
 
     logging.info(pformat(cfg.to_dict()))
@@ -326,18 +375,62 @@ def train(cfg: TrainPipelineConfig):
         )
 
     logging.info("Creating policy")
-    policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
-    # Keep the policy in bf16 for forward/backward (activation memory + bf16
-    # compute). The optimizer state is kept in fp32 separately: DeepSpeed
-    # ZeRO does this through ``BF16_Optimizer``; under DDP/FSDP/single we
-    # mirror that with ``MasterWeightOptimizer`` (see issue #181).
-    policy.to(torch.bfloat16)
+    # FSDP needs the policy built in fp32 so its ``MixedPrecision(
+    # param_dtype=bf16, reduce_dtype=bf16, buffer_dtype=bf16)`` policy can
+    # downcast on the fly while keeping the fp32 outer (master) params for
+    # AdamW to step on. Without this gate, ``Gemma3WithExpertModel.__init__``
+    # would call ``to_bfloat16_like_physical_intelligence`` and the params
+    # would already be bf16 by the time FSDP wraps them — MixedPrecision
+    # becomes a storage no-op and the optimizer ends up stepping on bf16
+    # sharded params with bf16 Adam state, which underflows on small late-
+    # training updates. Set the flag where it exists (currently only on
+    # ``Gemma3WithExpertConfig``); other policies that don't yet support
+    # FSDP simply lack the attribute.
+    if accelerator.distributed_type == accelerate.DistributedType.FSDP:
+        vlm_config = getattr(cfg.policy, "vlm_config", None)
+        if vlm_config is not None and hasattr(vlm_config, "disable_internal_bf16_cast"):
+            vlm_config.disable_internal_bf16_cast = True
+
+    # DeepSpeed ZeRO-3 installs a `partition_parameters` wrapper that shards
+    # parameters at construction time (`zero3_init_flag` only controls the
+    # transformers `from_pretrained` integration, not this wrapper). Some
+    # init paths — e.g. SigLIP's `lecun_normal_` → `_calculate_fan_in_and_fan_out`
+    # — need the full tensor shape and crash on a per-rank shard. Build the
+    # model with partitioning disabled; ZeRO will re-shard properly when
+    # `accelerator.prepare` wraps it. No-op for any non-ZeRO-3 backend.
+    with _zero3_disabled_init_context(accelerator):
+        policy = make_policy(cfg=cfg.policy, ds_meta=train_dataset.meta)
+    # Per-backend precision regime:
+    #   * DDP / single-process: outer ``policy.to(bfloat16)`` cast here makes
+    #     live params bf16, then ``MasterWeightOptimizer.from_existing``
+    #     (issue #181) layers fp32 master + fp32 Adam state on top.
+    #   * DeepSpeed ZeRO-1/2: outer ``policy.to(bfloat16)`` cast here, then
+    #     ``BF16_Optimizer`` keeps fp32 master + fp32 Adam state, reduces
+    #     gradients in bf16.
+    #   * FSDP-FULL_SHARD: skip the outer cast (and the model's inner
+    #     ``to_bfloat16_like_physical_intelligence`` was already gated above)
+    #     so the policy stays fp32 going into ``accelerator.prepare``. FSDP's
+    #     ``MixedPrecision`` then provides bf16 compute (forward/backward),
+    #     bf16 reduce-scatter (matches DeepSpeed), and the optimizer steps
+    #     on the fp32 outer (master) params with fp32 Adam state. Live
+    #     params consume HBM in fp32 (sharded across 8 ranks); compute
+    #     params materialize in bf16 transiently during the all-gather.
+    if accelerator.distributed_type != accelerate.DistributedType.FSDP:
+        policy.to(torch.bfloat16)
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-    # Outside DeepSpeed, wrap the optimizer so it carries fp32 master weights
-    # and fp32 Adam state. DeepSpeed already provides this via BF16_Optimizer
-    # (see ``ds_config['bf16']['enabled']``), so we don't double-wrap there.
-    if accelerator.distributed_type != accelerate.DistributedType.DEEPSPEED:
+    # Outside DeepSpeed *and* FSDP, wrap the optimizer so it carries fp32
+    # master weights and fp32 Adam state. DeepSpeed provides this via
+    # ``BF16_Optimizer``. FSDP provides it via ``MixedPrecision`` over the
+    # fp32-built policy — the optimizer was constructed over fp32 outer
+    # params and AdamW's exp_avg / exp_avg_sq are allocated to match → fp32.
+    # Wrapping with ``MasterWeightOptimizer`` on top of FSDP's flat-param
+    # handles also misaligns and triggers a NCCL desync during the first
+    # backward (observed empirically), so skip there too.
+    if accelerator.distributed_type not in (
+        accelerate.DistributedType.DEEPSPEED,
+        accelerate.DistributedType.FSDP,
+    ):
         optimizer = MasterWeightOptimizer.from_existing(optimizer)
         # ``make_optimizer_and_scheduler`` bound the LR scheduler to the
         # ORIGINAL ``torch.optim.AdamW`` (now discarded in favour of the

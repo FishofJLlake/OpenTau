@@ -1662,6 +1662,166 @@ class TestBuildHistoryBatchEmitsObsHistoryIsPad:
                 assert torch.all(cam[t] == 5.0), f"camera[{t}] zero-filled but mask says real"
 
 
+# Tests pinning the architectural invariants of the InterleavedDecoderLayer
+# refactor (commit aaefa6e). These are the things that, if broken, would
+# silently re-introduce the FSDP / ZeRO-3 NCCL desync that the refactor fixes
+# but CPU runs would still produce plausible-looking forward outputs from.
+class TestInterleavedDecoderLayer:
+    def test_module_list_built_with_correct_count(self):
+        """One InterleavedDecoderLayer per text-config layer."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        assert hasattr(model, "interleaved_layers")
+        assert isinstance(model.interleaved_layers, torch.nn.ModuleList)
+        assert len(model.interleaved_layers) == cfg.gemma3_config.text_config.num_hidden_layers
+        assert all(isinstance(layer, g3we.InterleavedDecoderLayer) for layer in model.interleaved_layers)
+
+    def test_source_module_lists_are_emptied(self):
+        """The original ``language_model.layers`` and ``gemma_expert.model.layers``
+        must be empty after init — otherwise FSDP / ZeRO-3 walks the module
+        tree and tries to wrap each layer twice."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        backbone_text = model._backbone_text_model()
+        assert len(backbone_text.layers) == 0
+        assert len(model.gemma_expert.model.layers) == 0
+
+    def test_each_parameter_registered_exactly_once(self):
+        """No Parameter object should appear under multiple module paths.
+        Double-registration breaks FSDP's flat-param construction."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        seen: dict[int, str] = {}
+        for name, param in model.named_parameters():
+            pid = id(param)
+            if pid in seen:
+                pytest.fail(f"parameter object {pid} registered at both {seen[pid]} and {name}")
+            seen[pid] = name
+
+    def test_state_dict_layer_keys_under_interleaved_prefix(self):
+        """All per-layer params must serialise under the ``interleaved_layers``
+        prefix (NOT under ``gemma3.language_model.model.layers`` or
+        ``gemma_expert.model.layers``). This is the documented post-refactor
+        key namespace."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        state_keys = list(model.state_dict().keys())
+        # Per-layer attention / mlp / norm weights must exist under the new path.
+        backbone_layer_keys = [k for k in state_keys if k.startswith("interleaved_layers.0.backbone_layer.")]
+        expert_layer_keys = [k for k in state_keys if k.startswith("interleaved_layers.0.expert_layer.")]
+        assert backbone_layer_keys, "no backbone layer keys under interleaved_layers"
+        assert expert_layer_keys, "no expert layer keys under interleaved_layers"
+        # And NOT under the old paths.
+        for key in state_keys:
+            assert ".language_model.model.layers." not in key, f"stale key path: {key}"
+            assert ".language_model.layers." not in key, f"stale key path: {key}"
+            assert "gemma_expert.model.layers." not in key, f"stale key path: {key}"
+
+    def test_train_expert_only_freezes_backbone_layers(self):
+        """When ``train_expert_only=True`` the backbone layers (now living
+        under ``interleaved_layers[i].backbone_layer``) must be frozen.
+        Pre-refactor this was achieved by freezing ``self.gemma3.parameters()``;
+        after the refactor those layers are no longer reachable from
+        ``self.gemma3``."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.train_expert_only = True
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        for layer in model.interleaved_layers:
+            for name, param in layer.backbone_layer.named_parameters():
+                assert not param.requires_grad, (
+                    f"backbone param interleaved_layers.*.backbone_layer.{name} should be frozen"
+                )
+            # Expert layer params must remain trainable.
+            for name, param in layer.expert_layer.named_parameters():
+                assert param.requires_grad, (
+                    f"expert param interleaved_layers.*.expert_layer.{name} should be trainable"
+                )
+
+    def test_train_expert_only_eval_propagates_to_backbone_layers(self):
+        """``train(mode=True)`` with ``train_expert_only=True`` must also
+        flip the backbone layers under interleaved_layers to ``.training=False``
+        — they used to live under ``self.gemma3`` which the original ``train``
+        method walks."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.train_expert_only = True
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        model.train(True)
+        for layer in model.interleaved_layers:
+            assert not layer.backbone_layer.training, "backbone layer not in eval mode"
+            # Expert layer should be in training mode.
+            assert layer.expert_layer.training, "expert layer should be training"
+
+    def test_attention_dispatch_is_resolved_at_call_time(self, monkeypatch):
+        """The InterleavedDecoderLayer must look up the attention dispatch
+        via ``parent.get_attention_interface()`` per forward, NOT capture it
+        at init. Otherwise tests / runtime adapters that monkey-patch
+        ``self.eager_attention_forward`` (existing pattern, see
+        TestNoSlidingWindowEnforcement above) silently bypass the patch."""
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        real_eager = model.eager_attention_forward
+        calls: list[int] = []
+
+        def spy_eager(*args, **kwargs):
+            calls.append(1)
+            return real_eager(*args, **kwargs)
+
+        monkeypatch.setattr(model, "eager_attention_forward", spy_eager)
+
+        batch, seq_len = 1, 4
+        hidden = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+        position_ids = torch.arange(seq_len)[None, :]
+        attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+        with torch.no_grad():
+            model.forward(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=[hidden, None],
+            )
+        # One call per layer.
+        assert len(calls) == cfg.gemma3_config.text_config.num_hidden_layers
+
+    def test_forward_seeded_determinism(self, monkeypatch):
+        """Two seeded forwards through the refactored stack must produce
+        bit-identical outputs (no rank-dependent ordering, no captured-once
+        objects breaking re-entrancy)."""
+        # Same convention as TestNoSlidingWindowEnforcement above — pin
+        # ``_preferred_dtype`` to fp32 so the layer's intra-forward casts
+        # don't mix bf16 weights with fp32 inputs.
+        monkeypatch.setattr(g3we, "_preferred_dtype", lambda: torch.float32)
+        cfg = _make_tiny_g3we_cfg()
+
+        def _one_run() -> torch.Tensor:
+            torch.manual_seed(0)
+            model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+            model.eval()
+            torch.manual_seed(1)
+            batch, seq_len = 1, 4
+            hidden = torch.randn(batch, seq_len, cfg.gemma3_config.text_config.hidden_size)
+            position_ids = torch.arange(seq_len)[None, :]
+            attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))[None]
+            with torch.no_grad():
+                outs, _ = model.forward(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=[hidden, None],
+                )
+            return outs[0].detach().clone()
+
+        out_a = _one_run()
+        out_b = _one_run()
+        assert torch.equal(out_a, out_b), "non-deterministic forward (refactor regression?)"
+
+    def test_attention_provider_not_in_state_dict(self):
+        """The cached attention dispatch provider must not leak into
+        ``state_dict`` (it's a callable, not a Parameter / Buffer / Module)."""
+        cfg = _make_tiny_g3we_cfg()
+        model = Gemma3WithExpertModel(cfg).to(dtype=torch.float32)
+        for key in model.state_dict():
+            assert "attention_interface" not in key, f"unexpected key: {key}"
+
+
 # disable_action_expert — the high-level planner never feeds the expert stream,
 # so it opts out of instantiating the ~860M-parameter Gemma-v1 action expert
 # (modeling_pi07_high_level.py:1157 always passes inputs_embeds=[prefix, None]).
@@ -1793,3 +1953,102 @@ class TestDisableActionExpert:
 
         cfg = PI07LowLevelConfig()
         assert cfg.vlm_config.disable_action_expert is False
+
+
+class TestDisableInternalBf16Cast:
+    """Locks in that ``disable_internal_bf16_cast=True`` actually skips the
+    in-``__init__`` ``to_bfloat16_like_physical_intelligence`` call. The flag
+    exists because FSDP needs fp32 outer params for ``MixedPrecision`` to
+    own the bf16-compute / fp32-master split — if the model casts itself to
+    bf16 before FSDP wraps, FSDP can't upcast and the optimizer ends up
+    stepping on bf16 sharded params with bf16 Adam state."""
+
+    def test_default_keeps_bf16_cast_active(self):
+        """Default (False) preserves pre-flag behaviour: per-layer params
+        are bf16 after init (matches the on-device dtype DeepSpeed/DDP
+        expect when they layer fp32 master back on top)."""
+        cfg = _make_tiny_g3we_cfg()
+        assert cfg.disable_internal_bf16_cast is False
+        model = Gemma3WithExpertModel(cfg)  # do NOT post-cast — read the in-init dtype
+        # Sample a per-layer param that ``to_bfloat16_like_physical_intelligence``
+        # always touches (interleaved_layers selector).
+        sample = model.interleaved_layers[0].backbone_layer.input_layernorm.weight
+        assert sample.dtype == torch.bfloat16, f"expected bf16 after default in-init cast, got {sample.dtype}"
+
+    def test_flag_skips_bf16_cast(self):
+        """With the flag, the same per-layer param stays in its constructed
+        dtype (fp32 from the HF backbone defaults)."""
+        cfg = _make_tiny_g3we_cfg()
+        cfg.disable_internal_bf16_cast = True
+        model = Gemma3WithExpertModel(cfg)
+        sample = model.interleaved_layers[0].backbone_layer.input_layernorm.weight
+        assert sample.dtype == torch.float32, f"expected fp32 (cast skipped), got {sample.dtype}"
+        # Also covers the SigLIP vision tower and the MM projector — all of
+        # the selectors ``to_bfloat16_like_physical_intelligence`` walks.
+        for name, param in model.named_parameters():
+            assert param.dtype == torch.float32, (
+                f"param {name} unexpectedly {param.dtype} (expected fp32 with cast skipped)"
+            )
+
+
+class TestGlobalOrBranchDecisions:
+    """Single-process / no-distributed coverage of ``_global_or_branch_decisions``.
+
+    The helper has two responsibilities: OR-reduce per-rank ``has_*`` flags
+    so all ranks branch identically, and assert cross-rank agreement on
+    field presence (None vs Tensor). Without ``torch.distributed`` initialised
+    it must short-circuit to identity on the local ``any_locals``. Multi-rank
+    NCCL behaviour is exercised by the FSDP integration matrix on 8×A100;
+    this class pins the no-distributed path and the input-validation contract.
+    """
+
+    def test_no_distributed_returns_local_any_flags(self):
+        """When ``torch.distributed`` is uninitialised, the helper must return
+        the local ``any_locals`` unchanged (no all-reduce, no presence check)."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        # Sanity: in a CPU pytest run there is no process group.
+        assert not torch.distributed.is_initialized()
+
+        out = _global_or_branch_decisions(
+            presence_locals=(True, False, True),
+            any_locals=(True, False, False),
+            field_names=("response", "subgoal", "metadata"),
+            device=torch.device("cpu"),
+        )
+        assert out == (True, False, False)
+
+    def test_no_distributed_coerces_truthy_inputs_to_bool(self):
+        """``presence_locals`` and ``any_locals`` are ``bool`` per the type
+        annotation, but the helper guards against numpy/scalar leaks by
+        coercing to Python ``bool``. The no-distributed path returns ``bool``
+        outputs even when fed truthy non-bool values."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        out = _global_or_branch_decisions(
+            presence_locals=(1, 0, 1),  # type: ignore[arg-type]
+            any_locals=(1, 0, 0),  # type: ignore[arg-type]
+            field_names=("a", "b", "c"),
+            device=torch.device("cpu"),
+        )
+        assert all(isinstance(x, bool) for x in out)
+        assert out == (True, False, False)
+
+    def test_length_mismatch_raises(self):
+        """Mismatched lengths between presence/any/names must fail loudly at
+        the call site rather than silently zip-truncate."""
+        from opentau.policies.pi07.low_level.modeling_pi07_low_level import (
+            _global_or_branch_decisions,
+        )
+
+        with pytest.raises(ValueError, match="same length"):
+            _global_or_branch_decisions(
+                presence_locals=(True, False),
+                any_locals=(True, False, False),
+                field_names=("a", "b", "c"),
+                device=torch.device("cpu"),
+            )

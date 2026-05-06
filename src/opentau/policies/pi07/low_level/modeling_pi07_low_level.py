@@ -68,6 +68,95 @@ def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
+def _global_or_branch_decisions(
+    presence_locals: tuple[bool, ...],
+    any_locals: tuple[bool, ...],
+    field_names: tuple[str, ...],
+    device: torch.device,
+) -> tuple[bool, ...]:
+    """Synchronize ``embed_prefix`` branch decisions across distributed ranks.
+
+    pi07's ``embed_prefix`` chooses Python-level branches based on whether the
+    local rank's micro-batch contains any subgoal images / response tokens /
+    metadata tokens. Each branch fires a different number of FSDP / ZeRO-3
+    all-gather collectives (one per ``embed_language_tokens`` call), so under
+    stochastic dataset drop probabilities — where one rank's batch may roll
+    "all dropped" while another rolls "some real" — the ranks would otherwise
+    take different branches and deadlock at NCCL with mismatched all-gather
+    sequence numbers.
+
+    This helper bundles two synchronizations into a *single* SUM all-reduce
+    (vs N independent 1-element MAX all-reduces before):
+
+    1. ``any_locals`` are OR-reduced across ranks. The returned ``has_*``
+       booleans drive the Python branches that fire collectives, so all
+       ranks must end up taking the same branch.
+    2. ``presence_locals`` are checked for cross-rank agreement. If any rank
+       has a field as None while another has it as a Tensor (a future
+       heterogeneous-mixture regression), this raises immediately rather
+       than letting the inner ``if has_response and response_tokens is not
+       None`` gates silently re-introduce the desync. Today every rank
+       instantiates the same ``embed_prefix`` contract, so divergence is a
+       loud bug, not normal operation.
+
+    Outside ``torch.distributed`` (single-process runs, CPU smoke tests)
+    the helper is a no-op that just returns the local ``any_locals``.
+
+    Args:
+        presence_locals: Per-field bools — ``True`` iff the local rank has a
+            non-None Tensor for that field. Checked for agreement only;
+            never returned.
+        any_locals: Per-field bools — ``True`` iff the local rank's mask has
+            any non-False entry. OR-reduced and returned. Each entry implies
+            the field is present locally (``any_locals[i] => presence_locals[i]``).
+        field_names: Human-readable field names parallel to the lists above
+            (used in the divergence error message).
+        device: Device to allocate the all-reduce buffer on; must match the
+            distributed backend (typically the policy's CUDA device).
+
+    Returns:
+        A tuple of OR-reduced ``has_*`` booleans, one per ``any_locals`` entry,
+        in the same order.
+
+    Raises:
+        RuntimeError: If any field's ``presence_locals`` value differs across
+            ranks. Error names the divergent field(s).
+    """
+    n = len(any_locals)
+    if not (len(presence_locals) == n and len(field_names) == n):
+        raise ValueError(
+            f"_global_or_branch_decisions: presence_locals/any_locals/field_names "
+            f"must have the same length, got "
+            f"{len(presence_locals)}/{n}/{len(field_names)}."
+        )
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return tuple(bool(a) for a in any_locals)
+    # One SUM all-reduce over [presence | any]: SUM lets us derive both the
+    # OR (sum > 0) for the any flags and the cross-rank-agreement check
+    # (sum == 0 or sum == world_size) for the presence flags.
+    flag = torch.tensor(
+        [int(bool(p)) for p in presence_locals] + [int(bool(a)) for a in any_locals],
+        device=device,
+        dtype=torch.int32,
+    )
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.SUM)
+    world_size = torch.distributed.get_world_size()
+    counts = flag.tolist()
+    presence_counts = counts[:n]
+    any_counts = counts[n:]
+    diverged = [(name, c) for name, c in zip(field_names, presence_counts, strict=True) if 0 < c < world_size]
+    if diverged:
+        raise RuntimeError(
+            "_global_or_branch_decisions: ranks disagree on field presence "
+            "(None vs Tensor). embed_prefix assumes per-field presence is a "
+            "global property of the dataset config; if a heterogeneous-mixture "
+            "change makes this no longer true, the None-vs-Tensor inner gates "
+            "would re-introduce the FSDP / ZeRO-3 desync. Divergent fields "
+            f"(name, ranks_with_non_None / world_size={world_size}): {diverged}."
+        )
+    return tuple(c > 0 for c in any_counts)
+
+
 def create_sinusoidal_pos_embedding(
     time: Tensor, dimension: int, min_period: float, max_period: float, device: torch.device | str = "cpu"
 ) -> Tensor:
@@ -1264,14 +1353,39 @@ class PI07LowLevelFlowMatching(nn.Module):
         # state-end separator collapses to ":\n" and the trailing prefix-end is
         # omitted, eliminating spurious dangling tokens that would otherwise break
         # the cumsum at the indicator -> first-discrete boundary.
-        has_response = (
-            response_tokens is not None and response_masks is not None and bool(response_masks.any())
-        )
-        has_subgoal = (
-            bool(subgoal_images) and bool(subgoal_img_masks) and any(bool(m.any()) for m in subgoal_img_masks)
-        )
-        has_metadata = (
-            metadata_tokens is not None and metadata_masks is not None and bool(metadata_masks.any())
+        #
+        # Each ``has_*`` flag is OR-reduced across all ranks via
+        # ``_global_or_branch_decisions``. Different ranks process different
+        # micro-batches, so under stochastic ``*_drop_prob`` settings their
+        # local ``.any()`` values can diverge. If we let each rank take its
+        # local branch, FSDP / ZeRO-3 would launch different numbers of param
+        # all-gathers per rank and deadlock at NCCL (observed empirically:
+        # rank 0,1,3,4,5,7 stuck at SeqNum=274 ALLREDUCE, rank 2,6 at
+        # SeqNum=279 ALLGATHER_BASE). Synchronizing the *branch decision* —
+        # not the data — keeps every rank running the same set of collectives.
+        # Ranks whose local data is all-dropped still embed real tokens with
+        # all-False masks; downstream attention / loss respect the mask, so
+        # accuracy is preserved.
+        #
+        # The same call also asserts cross-rank agreement on field *presence*
+        # (None vs Tensor), bundled into the same all-reduce. The inner gates
+        # (``if has_response and response_tokens is not None``) assume field
+        # presence is a global property of the dataset config. If a future
+        # heterogeneous-mixture change ever makes that not true, the helper
+        # raises a loud ``RuntimeError`` here rather than letting the branches
+        # silently re-desync and hang at NCCL hours into a run.
+        device = lang_tokens.device
+        response_present_local = response_tokens is not None and response_masks is not None
+        subgoal_present_local = bool(subgoal_images) and bool(subgoal_img_masks)
+        metadata_present_local = metadata_tokens is not None and metadata_masks is not None
+        has_response_local = response_present_local and bool(response_masks.any())
+        has_subgoal_local = subgoal_present_local and any(bool(m.any()) for m in subgoal_img_masks)
+        has_metadata_local = metadata_present_local and bool(metadata_masks.any())
+        has_response, has_subgoal, has_metadata = _global_or_branch_decisions(
+            presence_locals=(response_present_local, subgoal_present_local, metadata_present_local),
+            any_locals=(has_response_local, has_subgoal_local, has_metadata_local),
+            field_names=("response", "subgoal", "metadata"),
+            device=device,
         )
         has_any_optional = bool(has_response or has_subgoal or has_metadata)
 
@@ -1369,11 +1483,12 @@ class PI07LowLevelFlowMatching(nn.Module):
         # state-end separator (", " or ":\n") is text → causal per paper §VI.B.
         att_masks += [1] * num_state_end_embs
 
-        # Only embed response when at least one sample in the batch has real response tokens.
-        # With response_drop_prob=1.0 all masks are False; skipping avoids a spurious
-        # causal-block boundary (att_masks=[1,...]) that would corrupt cumsum for every
-        # subsequent token.
-        if response_tokens is not None and response_masks is not None and response_masks.any():
+        # Only embed response when at least one sample in *any rank's* batch has
+        # real response tokens. The decision is taken on the globally-synced
+        # ``has_response`` flag (computed above) — using a local ``.any()``
+        # check here would let different ranks diverge into different code
+        # paths and deadlock under FSDP / ZeRO-3.
+        if has_response and response_tokens is not None and response_masks is not None:
             response_emb = self.gemma3_with_expert.embed_language_tokens(response_tokens)
             embs.append(response_emb)
             pad_masks.append(response_masks)
@@ -1383,8 +1498,8 @@ class PI07LowLevelFlowMatching(nn.Module):
             num_response_embs = response_emb.shape[1]
             att_masks += [1] * num_response_embs
 
-        # Only embed metadata when at least one sample has real metadata tokens.
-        if metadata_tokens is not None and metadata_masks is not None and metadata_masks.any():
+        # Same global-synced gate for metadata.
+        if has_metadata and metadata_tokens is not None and metadata_masks is not None:
             metadata_emb = self.gemma3_with_expert.embed_language_tokens(metadata_tokens)
             embs.append(metadata_emb)
             pad_masks.append(metadata_masks)
@@ -1419,10 +1534,13 @@ class PI07LowLevelFlowMatching(nn.Module):
         # text (lang / state / response / metadata / ";\n ") and before the
         # training-only discrete-action block.
         #
-        # Only embed the subgoal block (header + images + footer) when subgoal images are
-        # actually present. Unconditionally adding "Subgoal: " injects real (non-padded)
-        # spurious tokens into every prefix even with subgoal_drop_prob=1.0.
-        if subgoal_images and any(mask.any() for mask in subgoal_img_masks):
+        # Same global-synced gate for the subgoal block. ``has_subgoal`` is
+        # globally OR-reduced above, so all ranks take this branch together
+        # whenever any rank's micro-batch has at least one real subgoal image.
+        # Skipping the local-``.any()`` branch and falling through to
+        # all-pad data on a rank that locally has none would re-introduce
+        # the FSDP NCCL desync.
+        if has_subgoal and subgoal_images:
             # Per-sample availability: True iff at least one camera slot
             # has a real subgoal image for that sample. In a mixed batch
             # (some samples have subgoals, others don't), the "Subgoal: "

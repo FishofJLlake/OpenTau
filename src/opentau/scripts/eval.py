@@ -24,6 +24,7 @@ import concurrent.futures as cf
 import datetime as dt
 import json
 import logging
+import re
 import threading
 import time
 from collections import defaultdict
@@ -887,6 +888,30 @@ def consolidate_eval_info(eval_infos: list[dict]) -> dict:
         "per_group": per_groups,
         "overall": overall,
     }
+
+
+def collect_grid_summary_videos(videos_dir: Path) -> list[tuple[str, str]]:
+    """Find per-task grid_summary.mp4 files under ``videos_dir`` for wandb logging.
+
+    Returns sorted ``(task_name, path)`` pairs, where ``task_name`` is the
+    per-task subdir name (``{task_group}_{task_id}_rank{N}``) with any trailing
+    ``_rank{N}`` stripped, so wandb keys stay stable across GPU-count changes.
+    Individual ``eval_episode_*.mp4`` clips are intentionally excluded.
+
+    Assumes each ``(task_group, task_id)`` is evaluated on exactly one rank, which
+    the disjoint round-robin task sharding guarantees (``idx % num_processes ==
+    process_index`` in ``envs/configs.py``). Under that assumption the stripped
+    key is unique; if the same task were ever evaluated on multiple ranks, the
+    keys would collide and the later video would overwrite the earlier one at the
+    same step.
+    """
+    if not videos_dir.exists():
+        return []
+    results = [
+        (re.sub(r"_rank\d+$", "", grid_path.parent.name), str(grid_path))
+        for grid_path in videos_dir.rglob("grid_summary.mp4")
+    ]
+    return sorted(results)
 
 
 def main():

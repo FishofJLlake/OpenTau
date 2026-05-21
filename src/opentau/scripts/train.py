@@ -26,6 +26,7 @@ from typing import Any
 
 import accelerate
 import torch
+import wandb
 from accelerate.optimizer import AcceleratedOptimizer
 from accelerate.scheduler import AcceleratedScheduler
 from accelerate.utils import DistributedDataParallelKwargs, gather_object
@@ -41,7 +42,7 @@ from opentau.optim.factory import make_optimizer_and_scheduler
 from opentau.optim.master_weights import MasterWeightOptimizer
 from opentau.policies.factory import make_policy
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.scripts.eval import consolidate_eval_info, eval_policy_all
+from opentau.scripts.eval import collect_grid_summary_videos, consolidate_eval_info, eval_policy_all
 from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 from opentau.utils.random_utils import set_seed
@@ -814,6 +815,19 @@ def train(cfg: TrainPipelineConfig):
                 videos_dir = cfg.output_dir / "eval" / f"videos_step_{step_id}"
                 with open(videos_dir / "eval_info.json", "w") as f:
                     json.dump(eval_info, f, indent=2)
+
+                # Log grid-summary eval videos to wandb (skip individual clips).
+                # Main-process-only, and globs the shared videos_dir, so it
+                # assumes every rank wrote to a filesystem the main process can
+                # read (true for the single-node multi-GPU setup; non-rank-0
+                # videos on a multi-node run without a shared FS won't be seen).
+                if cfg.wandb.enable and cfg.eval.max_episodes_rendered > 0:
+                    grid_videos = {
+                        f"Eval Videos/{task_name}": wandb.Video(grid_path)
+                        for task_name, grid_path in collect_grid_summary_videos(videos_dir)
+                    }
+                    if grid_videos:
+                        accelerator.log(grid_videos, step=step)
 
             # This barrier is to ensure all processes finishes evaluation before the next training step
             # Some processes might be slower than others

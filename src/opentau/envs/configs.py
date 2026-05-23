@@ -197,7 +197,16 @@ class LiberoEnv(EnvConfig):
         episode_length: Maximum length of each episode in steps.
         obs_type: Type of observations to use (e.g., ``"pixels_agent_pos"``).
         render_mode: Rendering mode for the environment (e.g., ``"rgb_array"``).
-        camera_name: Comma-separated names of cameras to use for rendering.
+        camera_name: Comma-separated LIBERO raw camera names to render — both
+            count and ordering of LIBERO cameras at eval are driven by this
+            string. Defaults to ``"agentview_image,robot0_eye_in_hand_image"``
+            (agentview + wrist eye-in-hand). Set to ``"agentview_image"``
+            (single camera) for agentview-only rollouts. When the underlying
+            policy was trained with a larger ``cfg.num_cams`` (e.g. a
+            multi-domain mixture with 4 camera slots),
+            ``preprocess_observation`` zero-fills the remaining ``cameraN``
+            slots so the train↔eval input structure stays aligned —
+            independent of how many real LIBERO cameras this field renders.
         init_states: Whether to initialize states randomly.
         camera_name_mapping: Optional mapping from camera names to standardized keys.
         features: Mapping from logical feature names to :class:`~opentau.configs.types.PolicyFeature` definitions.

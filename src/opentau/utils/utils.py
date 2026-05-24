@@ -149,6 +149,17 @@ def is_amp_available(device: str) -> bool:
 _logging_init_stack = ""
 
 
+# accelerate's save_accelerator_state emits one INFO line per dataloader; a
+# WeightedDatasetMixture run can have hundreds. The matching load path already
+# emits a single summary line, so silence the save side to match. The exact
+# prefix string was verified at accelerate>=1.4.0 (our floor in pyproject.toml)
+# through current main; re-check on the next accelerate bump.
+class _DropDataloaderSamplerSaveSpam(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not (msg.startswith("Sampler state for dataloader ") and " saved in " in msg)
+
+
 def _format_stack(stack: list[inspect.FrameInfo]) -> str:
     return "\n".join(
         f"  File '{frame.filename}', line {frame.lineno}, in {frame.function}"
@@ -192,6 +203,10 @@ def init_logging(accelerator: accelerate.Accelerator | None = None, level=loggin
     console_handler.setFormatter(CustomFormatter())
 
     logging.basicConfig(level=level, force=True, handlers=[console_handler])
+
+    accel_ckpt_logger = logging.getLogger("accelerate.checkpointing")
+    if not any(isinstance(f, _DropDataloaderSamplerSaveSpam) for f in accel_ckpt_logger.filters):
+        accel_ckpt_logger.addFilter(_DropDataloaderSamplerSaveSpam())
 
     if accelerator and not accelerator.is_main_process:
         # Disable duplicate logging on non-main processes

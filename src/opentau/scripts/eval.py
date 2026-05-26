@@ -50,10 +50,13 @@ from tqdm import trange
 
 from opentau.configs import parser
 from opentau.configs.train import TrainPipelineConfig
+from opentau.envs.configs import LiberoEnv
 from opentau.envs.factory import make_envs
+from opentau.envs.subgoal import LiberoLastFrameSubgoalGenerator, SubgoalImageGenerator
 from opentau.envs.utils import (
     add_envs_task,
     add_eval_metadata,
+    add_subgoal_images,
     check_env_attributes_and_types,
     close_envs,
     preprocess_observation,
@@ -78,6 +81,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -140,6 +144,7 @@ def rollout(
     )
     check_env_attributes_and_types(env)
     successes = np.zeros((env.num_envs,), dtype=bool)
+    subgoal_episode_picked = False
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to OpenTau policy format.
         observation = preprocess_observation(observation, cfg=cfg)
@@ -147,6 +152,14 @@ def rollout(
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)
         observation = add_eval_metadata(observation, cfg=cfg)
+        # Pick the per-env subgoal episode once per rollout (after the env's
+        # task prompts are known), then reuse the cached subgoal tensors on
+        # every step. Matches the "once per episode reset" cadence — each
+        # `rollout()` call corresponds to one `env.reset()`.
+        if subgoal_generator is not None and not subgoal_episode_picked:
+            subgoal_generator.start_episode(observation["prompt"])
+            subgoal_episode_picked = True
+        observation = add_subgoal_images(observation, subgoal_generator)
 
         if return_observations:
             all_observations.append(deepcopy(observation))
@@ -192,6 +205,13 @@ def rollout(
         observation = preprocess_observation(observation, cfg=cfg)
         observation = add_envs_task(env, observation)
         observation = add_eval_metadata(observation, cfg=cfg)
+        # Mirror the loop-body gate: only inject subgoals if the loop
+        # body ran at least once and called ``start_episode``. Guards
+        # against the theoretical zero-step rollout where the generator
+        # would otherwise raise ``RuntimeError("start_episode must be
+        # called first")`` from its ``__call__``.
+        if subgoal_episode_picked:
+            observation = add_subgoal_images(observation, subgoal_generator)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
@@ -231,6 +251,7 @@ def eval_policy(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     grid_size: tuple[int, int] | None = None,
+    subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> dict:
     """
     Args:
@@ -311,6 +332,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            subgoal_generator=subgoal_generator,
         )
         # Figure out where in each rollout sequence the first done condition was encountered (results after
         # this won't be included).
@@ -568,6 +590,34 @@ def create_grid_summary_video(
     logging.info(f"Grid summary video saved to: {output_path}")
 
 
+def make_subgoal_generator(cfg: TrainPipelineConfig) -> SubgoalImageGenerator | None:
+    """Construct the eval-time subgoal generator from `cfg.env`.
+
+    Returns ``None`` when the env is not a LIBERO env or
+    ``cfg.env.subgoal_source`` is unset — both cases fall back to the
+    policy's missing-key default in ``prepare_subgoal_images``.
+
+    Threads ``cfg.seed`` into the generator's per-instance RNG so the
+    per-rollout episode picks are reproducible across runs, and logs the
+    resolved dataset revision so a silent drift between
+    ``CODEBASE_VERSION`` and the source repo is visible in the eval log.
+    """
+    if not isinstance(cfg.env, LiberoEnv) or cfg.env.subgoal_source is None:
+        return None
+    generator = LiberoLastFrameSubgoalGenerator(
+        repo_id=cfg.env.subgoal_source,
+        resolution=tuple(cfg.resolution),
+        num_cams=cfg.num_cams,
+        seed=cfg.seed,
+    )
+    logging.info(
+        f"[subgoal] Loaded LiberoLastFrameSubgoalGenerator from {cfg.env.subgoal_source!r} "
+        f"(revision={generator.meta.revision!r}, resolution={cfg.resolution}, "
+        f"num_cams={cfg.num_cams}, seed={cfg.seed!r})."
+    )
+    return generator
+
+
 @parser.wrap()
 def eval_main(cfg: TrainPipelineConfig):
     accelerator = Accelerator()
@@ -589,6 +639,8 @@ def eval_main(cfg: TrainPipelineConfig):
     logging.info("Making environment.")
     envs = make_envs(cfg.env, cfg, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
+    subgoal_generator = make_subgoal_generator(cfg)
+
     logging.info("Making policy.")
 
     policy = make_policy(cfg=cfg.policy)
@@ -609,6 +661,7 @@ def eval_main(cfg: TrainPipelineConfig):
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             return_episode_data=bool(cfg.eval.recording_root),
+            subgoal_generator=subgoal_generator,
         )
 
         acc_print("Local Eval Info", eval_info)
@@ -652,6 +705,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> tuple[TaskMetrics, dict]:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -666,6 +720,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        subgoal_generator=subgoal_generator,
     )
 
     per_episode = task_result["per_episode"]
@@ -689,6 +744,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> tuple[str, int, TaskMetrics, dict]:
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -714,6 +770,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        subgoal_generator=subgoal_generator,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -740,6 +797,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    subgoal_generator: SubgoalImageGenerator | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -792,6 +850,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        subgoal_generator=subgoal_generator,
     )
 
     task_results = []

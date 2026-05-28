@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -51,6 +51,7 @@ from opentau.policies.pi06.gemma3_with_expert import (
     Gemma3WithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.utils import flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -186,42 +187,6 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
 
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
     return padded_img
-
-
-def flow_matching_masked_mse(
-    u_t: Tensor,
-    v_t: Tensor,
-    prefix_mask: Tensor,
-    actions_is_pad: Tensor | None,
-    max_action_dim: int,
-) -> Tensor:
-    """Masked MSE for π0.6 flow matching.
-
-    Zeros out (a) frozen-prefix steps from the real-time inference delay
-    (`prefix_mask=True` ⇒ frozen) and (b) fully-padded action samples — e.g.
-    VQA / web co-training items, where `VQADataset` sets `actions_is_pad`
-    all-True so the action expert is not trained to regress to zero on items
-    that have no real actions.
-
-    Args:
-        u_t: Target velocity field, shape `(B, chunk_size, D)` (D ≥ max_action_dim).
-        v_t: Predicted velocity field, same shape as `u_t`.
-        prefix_mask: bool `(B, chunk_size)` — True where the step is frozen
-            (real-time-inference delay). Pass `torch.zeros(...)` to disable.
-        actions_is_pad: optional bool `(B, chunk_size)` — True where the
-            action chunk is padded (no real action target).
-        max_action_dim: Number of leading action dims to score against;
-            trailing dims are dropped before averaging.
-    """
-    mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-    postfix_mask = rearrange(torch.logical_not(prefix_mask), "b c -> b c 1")
-    if actions_is_pad is not None:
-        in_episode_bound = rearrange(~actions_is_pad, "b c -> b c 1")
-        postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-    mse_loss = mse_loss * postfix_mask
-    mse_loss = mse_loss[:, :, :max_action_dim]
-    postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-    return mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
 
 
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
@@ -650,6 +615,7 @@ class PI06Policy(PreTrainedPolicy):
             time,
             discrete_actions,
             discrete_action_masks,
+            real_action_dim=batch.get("real_action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1011,6 +977,7 @@ class PI06FlowMatching(nn.Module):
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
+        real_action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Full training forward pass. Returns `{"MSE": ..., "CE": ...}`."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -1100,6 +1067,7 @@ class PI06FlowMatching(nn.Module):
             prefix_mask=prefix_mask,
             actions_is_pad=actions_is_pad,
             max_action_dim=self.config.max_action_dim,
+            real_action_dim=real_action_dim,
         )
 
         # Discrete-action cross-entropy (FAST tokens) via the dedicated head.

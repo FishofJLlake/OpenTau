@@ -37,7 +37,7 @@ from opentau.policies.pi0.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy
-from opentau.policies.utils import log_model_loading_keys
+from opentau.policies.utils import log_model_loading_keys, make_action_dim_mask
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -490,9 +490,40 @@ class PI0Policy(PreTrainedPolicy):
 
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
 
+        # NB: pi0 keeps the masked reduction inline rather than routing through
+        # `opentau.policies.utils.flow_matching_masked_mse` (which pi05 / pi05_mem /
+        # pi06 / pi07*/low_level share). Two reasons:
+        #   - no RTI-style frozen prefix (the shared helper's `prefix_mask` would
+        #     always default to None here, which is fine, but…)
+        #   - AWR weighting (`use_awr`) needs to apply between the masking and the
+        #     reduction, and the shared helper reduces internally — so pi0 would
+        #     need an extra `sample_weights` knob in the helper signature just for
+        #     this one call site. Keeping it inline preserves the shared helper's
+        #     minimal API.
+        # Crop to max_action_dim before masking so the shapes are well-defined when
+        # the model's velocity head emits extra trailing dims.
+        losses = losses[:, :, : self.config.max_action_dim]
+
+        # Per-timestep mask (B, chunk, 1) — True for real action steps.
         if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
+            timestep_mask = rearrange(~actions_is_pad, "b c -> b c 1")
+        else:
+            timestep_mask = torch.ones(
+                (losses.shape[0], losses.shape[1], 1), dtype=torch.bool, device=losses.device
+            )
+
+        # Per-dim mask (B, 1, D) — True for real action dims; backwards compatible
+        # all-True fallback when `real_action_dim` is absent.
+        dim_mask = make_action_dim_mask(
+            batch.get("real_action_dim"),
+            self.config.max_action_dim,
+            batch_size=losses.shape[0],
+            device=losses.device,
+        )
+        dim_mask = rearrange(dim_mask, "b d -> b 1 d")
+
+        full_mask = timestep_mask & dim_mask  # (B, chunk, D)
+        losses = losses * full_mask
 
         if self.config.use_awr:
             # weight loss based on exponent of advantage. Also clamp at awr_max_weight.
@@ -503,11 +534,8 @@ class PI0Policy(PreTrainedPolicy):
                 ),
                 "b -> b 1 1",
             )
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
 
-        # For backward pass
-        loss = losses.mean()
+        loss = losses.sum() / (full_mask.sum() + 1e-8)
 
         return {"MSE": loss, "CE": torch.zeros_like(loss, requires_grad=True)}
 

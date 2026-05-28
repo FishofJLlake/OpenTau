@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -44,6 +44,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.utils import flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -730,6 +731,7 @@ class PI05Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            real_action_dim=batch.get("real_action_dim"),
         )
 
         mse_loss = losses["MSE"]
@@ -1312,6 +1314,7 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        real_action_dim: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -1432,28 +1435,17 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
-
-        # mask out frozen actions and padded actions
-        postfix_mask = rearrange(
-            torch.logical_not(prefix_mask), "b c -> b c 1"
-        )  # 0 for frozen actions, 1 for non-frozen actions
-
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            in_episode_bound = rearrange(
-                in_episode_bound, "b c -> b c 1"
-            )  # 0 for padded actions, 1 for non-padded actions
-            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
-
-        mse_loss = mse_loss * postfix_mask
-
-        # Remove padding
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-
-        # Do not include frozen actions and padded actions in the mean loss calculation
-        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
-        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
+        # Shared masked-MSE reduction: AND-s frozen-prefix, timestep-pad, and
+        # dim-pad masks together and divides by the unmasked-slot count. See
+        # ``opentau.policies.utils.flow_matching_masked_mse`` for the full spec.
+        mse_loss = flow_matching_masked_mse(
+            u_t=u_t,
+            v_t=v_t,
+            max_action_dim=self.config.max_action_dim,
+            prefix_mask=prefix_mask,
+            actions_is_pad=actions_is_pad,
+            real_action_dim=real_action_dim,
+        )
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape

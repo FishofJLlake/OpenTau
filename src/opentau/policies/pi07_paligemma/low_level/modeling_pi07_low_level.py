@@ -38,6 +38,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from opentau.configs.policies import PreTrainedConfig
 from opentau.configs.types import NormalizationMode
 from opentau.policies.flash_attn_cuda import make_att_block_ids
+from opentau.policies.layers import PerGroupLinear
 from opentau.policies.normalize import Normalize, Unnormalize
 from opentau.policies.normalize import resolve_num_datasets as _num_datasets
 from opentau.policies.outlier_utils import detect_state_action_outliers
@@ -50,7 +51,7 @@ from opentau.policies.pi07.video_encoder import SpaceTimeSiglipVideoEncoder
 from opentau.policies.pi07_paligemma.low_level.configuration_pi07_low_level import (
     PI07PaligemmaLowLevelConfig,
 )
-from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.pretrained import PreTrainedPolicy, ProjectionRemapError, T
 from opentau.policies.utils import flow_matching_masked_mse
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
@@ -329,6 +330,16 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
     config_class = PI07PaligemmaLowLevelConfig
     name = "pi07_paligemma_low_level"
 
+    # Per-(robot_type, control_mode) projections live on the inner
+    # `self.model` (PerGroupLinear when `config.per_group_projection`), so their
+    # state-dict keys are `model.<proj>.weight` / `.bias`. The load path uses
+    # these to reconcile a checkpoint's projection rows with the policy's groups.
+    _PER_GROUP_PROJECTION_PREFIXES = (
+        "model.state_proj.",
+        "model.action_in_proj.",
+        "model.action_out_proj.",
+    )
+
     def __init__(
         self,
         config: PI07PaligemmaLowLevelConfig,
@@ -385,7 +396,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # Get vocab size from processor
         discrete_action_vocab_size = getattr(self.discrete_action_processor, "vocab_size", None)
         self.model = PI07PaligemmaLowLevelFlowMatching(
-            config, discrete_action_vocab_size=discrete_action_vocab_size
+            config, discrete_action_vocab_size=discrete_action_vocab_size, num_datasets=num_datasets
         )
 
         self.reset()
@@ -457,6 +468,38 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
         # Now manually load and remap the state dict
         acc = get_proc_accelerator()
         is_main_process = acc.is_main_process if acc else True
+        # When per-group projections are on, reconcile projection rows by group
+        # name. The checkpoint's own group ordering is its `dataset_names`; seed
+        # with the already-loaded `config.dataset_names` — which on an inference
+        # / resume round-trip *is* the checkpoint's ordering — so a transient
+        # failure of the source-config read below doesn't turn a loadable
+        # same-group checkpoint into a hard ProjectionRemapError. The explicit
+        # read still recovers the true old ordering for the continue-training
+        # path, where the passed cfg carries the *new* (superset / reordered)
+        # groups.
+        old_dataset_names: list[str] | None = None
+        if getattr(config, "per_group_projection", False):
+            seeded = getattr(config, "dataset_names", None)
+            old_dataset_names = list(seeded) if seeded else None
+            try:
+                source_config = PreTrainedConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                )
+                old_dataset_names = getattr(source_config, "dataset_names", None) or old_dataset_names
+            except Exception as e:  # noqa: BLE001
+                if is_main_process:
+                    logging.warning(
+                        "Could not read checkpoint dataset_names for per-group projection remap "
+                        "(%s); falling back to the policy's current dataset_names ordering.",
+                        e,
+                    )
         # Populated inside the try block when skip_normalization_weights fires;
         # used outside the try/except to gate the inf-buffer guard so the
         # ValueError is not swallowed by the broad `except Exception` that
@@ -524,6 +567,13 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             # `(*feat_shape,)` to the new `(1, *feat_shape)` stacked layout so pre-PR
             # checkpoints load via `model.load_state_dict(...)`.
             model._promote_legacy_norm_buffers_in_state_dict(remapped_state_dict)
+            # Reconcile per-(robot_type, control_mode) projection rows with this
+            # policy's groups: tile a legacy single head to all groups, name-remap
+            # an existing multi-head onto the new ordering, etc. Raises
+            # ProjectionRemapError on an irreconcilable shape; re-raised below so
+            # the broad handler does not swallow it into a warning + broken model.
+            # No-op when the policy declares no per-group projection prefixes.
+            model._remap_per_group_projection_weights_in_state_dict(remapped_state_dict, old_dataset_names)
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             # Hide deliberately-stripped buffer keys from the missing-keys
@@ -549,6 +599,11 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             if not unintended_missing and not unexpected_keys and is_main_process:
                 logging.info("All keys loaded successfully!")
 
+        except ProjectionRemapError:
+            # Deliberate, fatal incompatibility (e.g. a per-group checkpoint
+            # loaded into a non-per-group policy) — must not be swallowed into a
+            # warning + silently-broken model by the broad handler below.
+            raise
         except Exception as e:
             if is_main_process:
                 logging.warning("Could not remap state dict keys: %s", e)
@@ -1057,6 +1112,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             action_prefix=action_prefix,
             delay=delay,
             noise=noise,
+            group_index=dataset_index,
         )
 
         # Unpad actions
@@ -1113,6 +1169,7 @@ class PI07PaligemmaLowLevelPolicy(PreTrainedPolicy):
             noise=noise,
             time=time,
             real_action_dim=batch.get("real_action_dim"),
+            group_index=dataset_index,
         )
 
         mse_loss = losses["MSE"]
@@ -1691,15 +1748,26 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
     └────────────────────────────────────────────────────────────┘
     """
 
-    def __init__(self, config: PI07PaligemmaLowLevelConfig, discrete_action_vocab_size: int | None = None):
+    def __init__(
+        self,
+        config: PI07PaligemmaLowLevelConfig,
+        discrete_action_vocab_size: int | None = None,
+        num_datasets: int = 1,
+    ):
         """Initializes the PI07PaligemmaLowLevelFlowMatching model.
 
         Args:
             config: Model configuration.
             discrete_action_vocab_size: Size of the discrete action vocabulary.
+            num_datasets: Number of (robot_type, control_mode) groups — the
+                leading dim of the stacked Normalize/Unnormalize buffers. Used
+                as the number of per-group projection heads when
+                ``config.per_group_projection`` is set, so the projection axis
+                stays in lockstep with the norm-head axis. Defaults to 1.
         """
         super().__init__()
         self.config = config
+        self.num_datasets = num_datasets
 
         paligemma_with_expert_config = PaliGemmaWithExpertConfig(
             freeze_vision_encoder=self.config.freeze_vision_encoder,
@@ -1721,11 +1789,23 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         )
 
         vlm_hidden_size = self.paligemma_with_expert.config.paligemma_config.text_config.hidden_size
-        self.state_proj = nn.Linear(self.config.max_state_dim, vlm_hidden_size)
+
+        # Per-(robot_type, control_mode) state/action projections share the
+        # norm-head grouping: when `per_group_projection` is on, each of the
+        # three projections holds one (weight, bias) per group, selected
+        # per-sample by the same index that picks the norm head. When off they
+        # are plain nn.Linear, byte-identical to the pre-flag model. time_mlp_*
+        # stay shared either way.
+        def _make_proj(in_features: int, out_features: int) -> nn.Module:
+            if self.config.per_group_projection:
+                return PerGroupLinear(in_features, out_features, num_groups=self.num_datasets)
+            return nn.Linear(in_features, out_features)
+
+        self.state_proj = _make_proj(self.config.max_state_dim, vlm_hidden_size)
 
         # Projections are float32
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
-        self.action_out_proj = nn.Linear(self.config.proj_width, self.config.max_action_dim)
+        self.action_in_proj = _make_proj(self.config.max_action_dim, self.config.proj_width)
+        self.action_out_proj = _make_proj(self.config.proj_width, self.config.max_action_dim)
 
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
@@ -1826,7 +1906,24 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         )
         return run_image_tower
 
-    def _embed_item(self, item: ContextItem, *, run_image_tower: bool | None = None) -> tuple[Tensor, Tensor]:
+    @staticmethod
+    def _apply_proj(proj: nn.Module, x: Tensor, group_index: Tensor | None) -> Tensor:
+        """Call a projection that may be a plain ``nn.Linear`` or a ``PerGroupLinear``.
+
+        Keeps the call sites uniform: a ``PerGroupLinear`` additionally receives
+        the per-sample ``group_index``; any other callable (plain ``nn.Linear``,
+        or the 1-arg lambda / ``nn.Identity`` stubs the unit tests inject) is
+        called as ``proj(x)`` and ignores the index. The dispatch is on module
+        *type* (a construction-time, rank-invariant property), not on batch
+        data, so it fires no collective (CLAUDE.md rule 5).
+        """
+        if isinstance(proj, PerGroupLinear):
+            return proj(x, group_index)
+        return proj(x)
+
+    def _embed_item(
+        self, item: ContextItem, *, run_image_tower: bool | None = None, group_index: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
         """Embed a single ``ContextItem`` and return ``(emb, expanded_pad_mask)``.
 
         Dispatches on ``item.item_type``:
@@ -1870,13 +1967,13 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             emb = emb * math.sqrt(emb.shape[-1])
             return emb, item.pad_mask
         if t == "state":
-            emb = self.state_proj(item.data.to(dtype=_preferred_dtype()))
+            emb = self._apply_proj(self.state_proj, item.data.to(dtype=_preferred_dtype()), group_index)
             return emb, item.pad_mask
         if t == "discrete_action":
             emb = self.paligemma_with_expert.embed_discrete_actions(item.data)
             return emb.to(dtype=_preferred_dtype()), item.pad_mask
         if t == "action":
-            emb = self.action_in_proj(item.data.to(dtype=_preferred_dtype()))
+            emb = self._apply_proj(self.action_in_proj, item.data.to(dtype=_preferred_dtype()), group_index)
             return emb, item.pad_mask
         if t == "image":
             # Subgoal images: 4-D (B, C, H, W) in [-1, 1] through the VLM's
@@ -1956,7 +2053,9 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             return [1] * length
         raise ValueError(f"Unknown attention mode: {mode!r}")
 
-    def embed_prefix(self, items: list[ContextItem]) -> tuple[Tensor, Tensor, Tensor, int]:
+    def embed_prefix(
+        self, items: list[ContextItem], group_index: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, int]:
         """Embed a layout-agnostic list of ``ContextItem``s into the prefix.
 
         The policy decides what blocks go into the prefix and in what
@@ -1989,7 +2088,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         cross_att_running = 0
         cross_att_locked = False
         for item in items:
-            emb, mask = self._embed_item(item, run_image_tower=run_image_tower)
+            emb, mask = self._embed_item(item, run_image_tower=run_image_tower, group_index=group_index)
             length = emb.shape[1]
             embs.append(emb)
             pad_masks.append(mask)
@@ -2010,7 +2109,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         return embs_cat, pad_masks_cat, att_masks, cross_att_running
 
     def embed_suffix(
-        self, items: list[ContextItem], timestep: Tensor
+        self, items: list[ContextItem], timestep: Tensor, group_index: Tensor | None = None
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed the action expert's suffix from a list of ``ContextItem``s.
 
@@ -2050,7 +2149,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         att_masks_flat: list[int] = []
 
         for item in items:
-            emb, mask = self._embed_item(item)
+            emb, mask = self._embed_item(item, group_index=group_index)
             length = emb.shape[1]
             embs.append(emb)
             pad_masks.append(mask)
@@ -2074,6 +2173,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         noise: Tensor | None = None,
         time: Tensor | None = None,
         real_action_dim: Tensor | None = None,
+        group_index: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass and compute the loss.
 
@@ -2095,7 +2195,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             A dictionary containing the loss components ("MSE" and "CE").
         """
         prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
-            prefix_items
+            prefix_items, group_index=group_index
         )
 
         use_flash = flash_cuda_active(self.config.attention_implementation)
@@ -2138,7 +2238,9 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         u_t = noise - actions
 
         suffix_items = self._build_suffix_items(x_t)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(suffix_items, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            suffix_items, time, group_index=group_index
+        )
 
         action_expert_2d_attention_mask, action_expert_block_ids = build_attention_inputs(
             use_flash,
@@ -2175,7 +2277,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         # training target (chunk_size is the prediction horizon).
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self._apply_proj(self.action_out_proj, suffix_out, group_index)
         v_t = v_t.to(dtype=torch.float32)
 
         # Shared masked-MSE reduction; see pi05 for the rationale.
@@ -2242,6 +2344,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         action_prefix: Tensor,
         delay: Tensor,
         noise: Tensor | None = None,
+        group_index: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -2257,7 +2360,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             The sampled action tensor.
         """
         prefix_embs, prefix_pad_masks, prefix_att_masks, num_cross_att_tokens = self.embed_prefix(
-            prefix_items
+            prefix_items, group_index=group_index
         )
         bsize = prefix_embs.shape[0]
         device = prefix_embs.device
@@ -2300,6 +2403,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 masked_time,
+                group_index=group_index,
             )
 
             # Euler step
@@ -2316,6 +2420,7 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
         time: Tensor,
+        group_index: Tensor | None = None,
     ) -> Tensor:
         """Apply one denoising step of the noise `x_t` at a given timestep.
 
@@ -2328,7 +2433,9 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
             The predicted velocity tensor (v_t).
         """
         suffix_items = self._build_suffix_items(x_t)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(suffix_items, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            suffix_items, time, group_index=group_index
+        )
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         use_flash = flash_cuda_active(self.config.attention_implementation)
@@ -2359,6 +2466,6 @@ class PI07PaligemmaLowLevelFlowMatching(nn.Module):
         # n_action_steps (execution horizon) is applied later in select_action, not
         # at decode time.
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        v_t = self.action_out_proj(suffix_out)
+        v_t = self._apply_proj(self.action_out_proj, suffix_out, group_index)
         v_t = v_t.to(dtype=torch.float32)
         return v_t

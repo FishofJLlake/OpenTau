@@ -32,7 +32,7 @@ import torch
 import wandb
 from accelerate.optimizer import AcceleratedOptimizer
 from accelerate.scheduler import AcceleratedScheduler
-from accelerate.utils import DistributedDataParallelKwargs, gather_object
+from accelerate.utils import DistributedDataParallelKwargs, broadcast_object_list, gather_object
 from termcolor import colored
 
 from opentau.configs import parser
@@ -56,6 +56,7 @@ from opentau.utils.accelerate_utils import set_proc_accelerator
 from opentau.utils.logging_utils import AverageMeter, MetricsTracker
 from opentau.utils.random_utils import set_seed
 from opentau.utils.train_utils import (
+    find_missing_rng_state_ranks,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -504,6 +505,18 @@ def train(cfg: TrainPipelineConfig):
         accelerator_kwargs["log_with"] = "wandb"
 
     accelerator = accelerate.Accelerator(**accelerator_kwargs)
+    # ``cfg.output_dir`` embeds a per-process wall-clock timestamp (assigned in
+    # ``TrainPipelineConfig`` as ``f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{job_name}"``) and every
+    # rank parses the config independently, so a launch whose startup straddles a one-second
+    # tick leaves ranks disagreeing on ``output_dir`` (e.g. one rank lands on ``HH-MM-49``
+    # while the rest use ``HH-MM-50``). Each rank then writes its checkpoint shard / RNG state
+    # into a *sibling* directory, silently yielding a checkpoint with fewer than ``world_size``
+    # shards that cannot be consolidated or resumed. Broadcast rank 0's value so all ranks
+    # share one output tree before ``output_dir`` is first used (the Accelerator does not
+    # consume ``output_dir``, so doing this immediately after construction is safe).
+    _output_dir = [str(cfg.output_dir)]
+    broadcast_object_list(_output_dir, from_process=0)
+    cfg.output_dir = Path(_output_dir[0])
     init_logging(accelerator, level=logging.DEBUG if cfg.debug else logging.INFO)
     # Register accelerator globally for use in other modules, (e.g., detect current rank, etc.)
     set_proc_accelerator(accelerator)
@@ -875,6 +888,23 @@ def train(cfg: TrainPipelineConfig):
                     prune_old_checkpoints(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+            # Defense-in-depth tripwire for the partial-save / output_dir-divergence failure
+            # mode: accelerate writes one ``random_states_<process_index>.pkl`` per process on
+            # every backend, so a complete checkpoint has one per rank. Surface a missing rank
+            # loudly here (the hard failure otherwise only appears at resume/consolidation time).
+            if accelerator.is_main_process:
+                missing_ranks = find_missing_rng_state_ranks(checkpoint_dir, accelerator.num_processes)
+                if missing_ranks:
+                    logging.error(
+                        "CHECKPOINT INCOMPLETE: %s is missing per-rank RNG state for rank(s) %s "
+                        "(have %d/%d). A rank likely wrote to a different output_dir or failed to "
+                        "save; this checkpoint is not resumable.",
+                        checkpoint_dir,
+                        missing_ranks,
+                        accelerator.num_processes - len(missing_ranks),
+                        accelerator.num_processes,
+                    )
 
         if is_val_step and val_dataloader is not None:
             policy.eval()

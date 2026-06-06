@@ -124,6 +124,20 @@ class TrainPipelineConfig(HubMixin):
             is disabled. Defaults to 0.
         last_checkpoint_only: If True, only evaluate the last checkpoint.
             Defaults to True.
+        running_best_count: Number of "running best" checkpoints to keep, i.e. the
+            checkpoint(s) that achieved the best metric so far. If 0, the feature is disabled
+            (like `eval_freq`/`val_freq`). When >= 1, after an eval/validation step that hits a
+            new best the current weights are saved (or, if that step already wrote a regular
+            `save_freq` checkpoint, that directory is reused); older running-bests are evicted
+            down to `running_best_count`, but one that coincided with a regular checkpoint is
+            left to the normal retention logic. Running-bests are protected from
+            `last_checkpoint_only` pruning, and work even when `save_checkpoint` is False (only
+            the best-performing checkpoints are then written, so resume granularity is limited
+            to running-best steps). Defaults to 0.
+        running_best_metric: Which metric drives the running best. One of "auto", "eval_success"
+            (maximize sim-eval success rate), or "val_loss" (minimize validation loss). "auto"
+            resolves to "eval_success" when sim eval is configured (env set and eval_freq > 0),
+            otherwise "val_loss". Only used when `running_best_count` >= 1. Defaults to "auto".
         server: Configuration for the gRPC inference server. Defaults to ServerConfig().
     """
 
@@ -174,12 +188,20 @@ class TrainPipelineConfig(HubMixin):
     eval_freq: int = 0  # evaluate every eval_freq steps
     val_freq: int = 0  # validate every val_freq steps, if 0, then a validation split is not created
     last_checkpoint_only: bool = True
+    # Keep the best-performing checkpoint(s) ("running best") in addition to the regular ones.
+    # 0 disables the feature (cf. eval_freq/val_freq); >= 1 keeps that many running bests.
+    running_best_count: int = 0
+    running_best_metric: str = "auto"  # "auto" | "eval_success" | "val_loss"
     # gRPC inference server configuration
     server: ServerConfig = field(default_factory=ServerConfig)
 
     def __post_init__(self):
         """Initialize post-creation attributes and validate batch size configuration."""
         self.checkpoint_path = None
+        # Runtime-only resolution of ``running_best_metric`` ("auto" -> concrete metric),
+        # set in ``validate()``. Deliberately not a dataclass field so it is never serialized
+        # (a resumed "auto" run must stay "auto", not freeze to whatever it resolved to once).
+        self.running_best_metric_resolved = None
 
         if self.dataloader_batch_size is None and self.batch_size is None:
             raise ValueError("At least one of `batch_size` and `dataloader_batch_size` should be set.")
@@ -286,6 +308,60 @@ class TrainPipelineConfig(HubMixin):
                         "treated as 1 when unset). Set dataset_mixture.n_obs_history "
                         "to match policy.n_obs_steps."
                     )
+
+        self._validate_running_best()
+
+    def _validate_running_best(self):
+        """Validate the running-best checkpoint config and resolve the driving metric.
+
+        The feature is enabled by ``running_best_count`` >= 1 (0 disables it, like
+        ``eval_freq``/``val_freq``). Sets ``self.running_best_metric_resolved`` to a concrete
+        metric ("eval_success" or "val_loss") when enabled. The ``running_best_metric`` /
+        ``running_best_count`` bounds are checked unconditionally so a bad value is caught even
+        when the feature is off.
+
+        Raises:
+            ValueError: If ``running_best_count`` < 0, ``running_best_metric`` is not one of the
+                allowed values, or the feature is enabled without a usable metric source.
+        """
+        allowed = {"auto", "eval_success", "val_loss"}
+        if self.running_best_metric not in allowed:
+            raise ValueError(
+                f"running_best_metric must be one of {sorted(allowed)}, got {self.running_best_metric!r}."
+            )
+        if self.running_best_count < 0:
+            raise ValueError(f"running_best_count must be >= 0, got {self.running_best_count}.")
+
+        if self.running_best_count == 0:
+            return
+
+        has_eval = self.env is not None and self.eval_freq > 0
+        has_val = self.val_freq > 0
+        if self.running_best_metric == "eval_success" and not has_eval:
+            raise ValueError(
+                "running_best_count >= 1 with running_best_metric='eval_success' requires a sim eval "
+                "source: set env and eval_freq > 0."
+            )
+        if self.running_best_metric == "val_loss" and not has_val:
+            raise ValueError(
+                "running_best_count >= 1 with running_best_metric='val_loss' requires val_freq > 0."
+            )
+        if self.running_best_metric == "auto" and not (has_eval or has_val):
+            raise ValueError(
+                "running_best_count >= 1 but no metric source is configured. Set eval_freq > 0 "
+                "with an env (for eval success rate), or val_freq > 0 (for validation loss)."
+            )
+        # Resolve "auto": prefer sim eval when available, else validation loss.
+        if self.running_best_metric == "auto":
+            self.running_best_metric_resolved = "eval_success" if has_eval else "val_loss"
+        else:
+            self.running_best_metric_resolved = self.running_best_metric
+
+        if not self.save_checkpoint:
+            warn(
+                "running_best_count >= 1 but save_checkpoint is False; only running-best "
+                "checkpoints will be saved, so resume granularity is limited to running-best steps."
+            )
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

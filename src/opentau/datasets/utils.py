@@ -718,12 +718,56 @@ def load_image_as_numpy(
     return img_array
 
 
+_DROPPED_NONTENSOR_COLUMNS_WARNED: set[str] = set()
+
+
+def _warn_dropped_nontensor_column_once(key: str) -> None:
+    """Warn once per column that a non-tensorizable field was dropped.
+
+    Args:
+        key: Name of the column dropped from the sample dict.
+    """
+    if key not in _DROPPED_NONTENSOR_COLUMNS_WARNED:
+        _DROPPED_NONTENSOR_COLUMNS_WARNED.add(key)
+        logging.warning(
+            "hf_transform_to_torch: dropping column %r whose values are not "
+            "convertible to tensors (e.g. a dict/struct annotation column such "
+            "as `language_persistent`). It is not a model input; this is "
+            "expected for datasets carrying auxiliary annotation fields.",
+            key,
+        )
+
+
+def _is_dict_like(value) -> bool:
+    """Return True if a column value is a dict or a list/tuple of dicts.
+
+    Such values come from struct / list-of-struct parquet columns (e.g.
+    chat-style ``language_persistent`` annotations) and cannot be converted to
+    tensors. Plain numeric scalars/sequences (and string columns) are not
+    dict-like, so a genuinely malformed model-input column still raises loudly at
+    ``torch.tensor`` instead of being silently dropped.
+
+    Args:
+        value: A single column value taken from one dataset row.
+    """
+    if isinstance(value, dict):
+        return True
+    if isinstance(value, (list, tuple)) and value:
+        return _is_dict_like(value[0])
+    return False
+
+
 def hf_transform_to_torch(items_dict: dict[str, list]):
     """Get a transform function that convert items from Hugging Face dataset (pyarrow)
     to torch tensors. Importantly, images are converted from PIL, which corresponds to
     a channel last representation (h w c) of uint8 type, to a torch image representation
     with channel first (c h w) of float32 type in range [0,1].
+
+    Columns whose values cannot be converted to tensors (e.g. dict/struct
+    annotation columns such as ``language_persistent``) are not model inputs and
+    are dropped from the returned dict rather than crashing the dataloader.
     """
+    drop_keys: list[str] = []
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
@@ -731,8 +775,20 @@ def hf_transform_to_torch(items_dict: dict[str, list]):
             items_dict[key] = [to_tensor(img) for img in items_dict[key]]
         elif first_item is None:
             pass
+        elif _is_dict_like(first_item):
+            # Struct / list-of-struct annotation columns (e.g. chat-style
+            # language annotations such as `language_persistent`) are not model
+            # inputs and cannot be converted to tensors. Drop them so the
+            # dataloader/collate does not choke. Narrowed to dict-like values so
+            # a genuinely malformed model-input column (e.g. a ragged `action`)
+            # still raises loudly at `torch.tensor` below instead of being
+            # silently dropped here.
+            drop_keys.append(key)
         else:
             items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+    for key in drop_keys:
+        _warn_dropped_nontensor_column_once(key)
+        del items_dict[key]
     return items_dict
 
 

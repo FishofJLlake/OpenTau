@@ -233,6 +233,15 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
+def apply_classifier_free_guidance(
+    conditional_velocity: Tensor,
+    unconditional_velocity: Tensor,
+    guidance_scale: float,
+) -> Tensor:
+    """Combine conditional and unconditional flow velocities."""
+    return unconditional_velocity + guidance_scale * (conditional_velocity - unconditional_velocity)
+
+
 class PI05Policy(PreTrainedPolicy):
     """Wrapper class around PI05FlowMatching model to train and run inference within OpenTau."""
 
@@ -669,6 +678,7 @@ class PI05Policy(PreTrainedPolicy):
             delay,
             noise=noise,
             state=state,
+            advantage=batch.get("advantage"),
         )
 
         # Unpad actions
@@ -726,6 +736,11 @@ class PI05Policy(PreTrainedPolicy):
         )  # in actions_is_pad we have False for real actions and True for padded actions
 
         state = self.prepare_state(batch) if self.config.state_type == "continuous" else None
+        advantage = batch.get("advantage")
+        if self.config.advantage == "use" and advantage is None:
+            raise ValueError(
+                "PI05 advantage='use' requires batch['advantage'] during training and validation."
+            )
         losses = self.model.forward(
             images,
             img_masks,
@@ -740,6 +755,7 @@ class PI05Policy(PreTrainedPolicy):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            advantage=advantage,
             real_action_dim=batch.get("real_action_dim"),
             return_per_sample=return_per_sample,
         )
@@ -1039,6 +1055,82 @@ class PI05FlowMatching(nn.Module):
         # match mode (no new IDs, no embedding resize on PaliGemma) and
         # mutates the shared tokenizer instance for `PI05Policy` too.
         ensure_loc_tokens(self.language_tokenizer)
+        self._register_advantage_tokens()
+        self._missing_inference_advantage_logged = False
+
+    def _register_advantage_tokens(self) -> None:
+        """Pre-tokenize equal-width positive/negative advantage indicators."""
+        positive = self.language_tokenizer.encode("Advantage: positive\n", add_special_tokens=False)
+        negative = self.language_tokenizer.encode("Advantage: negative\n", add_special_tokens=False)
+        length = max(len(positive), len(negative))
+        pad_id = self.language_tokenizer.pad_token_id or 0
+
+        def _pad(token_ids: list[int]) -> tuple[Tensor, Tensor]:
+            pad = length - len(token_ids)
+            tokens = torch.tensor(token_ids + [pad_id] * pad, dtype=torch.long)
+            masks = torch.tensor([True] * len(token_ids) + [False] * pad, dtype=torch.bool)
+            return tokens, masks
+
+        positive_tokens, positive_masks = _pad(positive)
+        negative_tokens, negative_masks = _pad(negative)
+        self.register_buffer("_advantage_positive_tokens", positive_tokens, persistent=False)
+        self.register_buffer("_advantage_positive_masks", positive_masks, persistent=False)
+        self.register_buffer("_advantage_negative_tokens", negative_tokens, persistent=False)
+        self.register_buffer("_advantage_negative_masks", negative_masks, persistent=False)
+
+    @property
+    def advantage_indicator_length(self) -> int:
+        return int(self._advantage_positive_tokens.shape[0])
+
+    def prepare_advantage_tokens(
+        self,
+        advantage: Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        apply_cfg_dropout: bool,
+        inference: bool,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Build a fixed-width advantage block, or return ``None`` for ignore."""
+        if self.config.advantage == "ignore":
+            return None, None
+        if self.config.advantage == "use" and advantage is None:
+            if inference:
+                if not self._missing_inference_advantage_logged:
+                    logging.debug(
+                        "PI05 inference received no advantage in 'use' mode; falling back to ignore."
+                    )
+                    self._missing_inference_advantage_logged = True
+                return None, None
+            raise ValueError("PI05 advantage='use' requires an advantage tensor.")
+
+        positive_tokens = self._advantage_positive_tokens.to(device=device)
+        positive_masks = self._advantage_positive_masks.to(device=device)
+        negative_tokens = self._advantage_negative_tokens.to(device=device)
+        negative_masks = self._advantage_negative_masks.to(device=device)
+
+        if self.config.advantage == "on":
+            is_positive = torch.ones(batch_size, dtype=torch.bool, device=device)
+        else:
+            advantage = advantage.to(device=device).reshape(-1)
+            if advantage.shape[0] != batch_size:
+                raise ValueError(f"advantage must have shape ({batch_size},), got {tuple(advantage.shape)}.")
+            is_positive = advantage >= self.config.advantage_threshold
+
+        tokens = torch.where(
+            rearrange(is_positive, "b -> b 1"),
+            positive_tokens.expand(batch_size, -1),
+            negative_tokens.expand(batch_size, -1),
+        )
+        masks = torch.where(
+            rearrange(is_positive, "b -> b 1"),
+            positive_masks.expand(batch_size, -1),
+            negative_masks.expand(batch_size, -1),
+        )
+        if apply_cfg_dropout and self.config.cfg_dropout > 0:
+            drop = torch.rand(batch_size, device=device) < self.config.cfg_dropout
+            masks = masks & ~rearrange(drop, "b -> b 1")
+        return tokens, masks
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.
@@ -1085,6 +1177,8 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        advantage_tokens: Tensor | None = None,
+        advantage_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -1104,8 +1198,8 @@ class PI05FlowMatching(nn.Module):
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
-            indicator_tokens: Optional indicator token tensor.
-            indicator_masks: Optional indicator mask tensor.
+            advantage_tokens: Optional fixed-width advantage indicator tokens.
+            advantage_masks: Optional advantage token padding masks.
 
         Returns:
             A tuple containing:
@@ -1217,6 +1311,15 @@ class PI05FlowMatching(nn.Module):
             num_response_embs = response_emb.shape[1]
             att_masks += [1] * num_response_embs
 
+        if advantage_tokens is not None:
+            if advantage_masks is None:
+                raise ValueError("advantage_masks is required when advantage_tokens is provided.")
+            advantage_emb = self.paligemma_with_expert.embed_language_tokens(advantage_tokens)
+            advantage_emb = advantage_emb * math.sqrt(advantage_emb.shape[-1])
+            embs.append(advantage_emb)
+            pad_masks.append(advantage_masks)
+            att_masks += [1] * advantage_emb.shape[1]
+
         if discrete_actions is not None:
             discrete_action_indicator_ids = self.language_tokenizer.encode(
                 "Action: ", add_special_tokens=False
@@ -1325,6 +1428,7 @@ class PI05FlowMatching(nn.Module):
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
         state: Tensor | None = None,
+        advantage: Tensor | None = None,
         real_action_dim: Tensor | None = None,
         return_per_sample: bool = False,
     ) -> dict[str, Tensor | PerSampleLoss]:
@@ -1344,12 +1448,20 @@ class PI05FlowMatching(nn.Module):
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
-            indicator_tokens: Optional indicator token tensor.
-            indicator_masks: Optional indicator mask tensor.
+            advantage: Optional per-sample scalar advantage tensor.
 
         Returns:
             A dictionary containing the loss components ("MSE" and "CE").
         """
+        advantage_tokens, advantage_masks = self.prepare_advantage_tokens(
+            advantage,
+            batch_size=actions.shape[0],
+            device=lang_tokens.device,
+            apply_cfg_dropout=self.training,
+            inference=False,
+        )
+        advantage_length = 0 if advantage_tokens is None else advantage_tokens.shape[1]
+
         # Run VLM first to get key value cache
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
@@ -1361,6 +1473,8 @@ class PI05FlowMatching(nn.Module):
             discrete_actions,
             discrete_action_masks,
             state=state,
+            advantage_tokens=advantage_tokens,
+            advantage_masks=advantage_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -1494,13 +1608,17 @@ class PI05FlowMatching(nn.Module):
             batch_size, seq_len = response_tokens.shape
             response_token_start = (
                 -self.config.response_max_length
+                - advantage_length
                 - self.config.discrete_action_max_length
                 - self.config.discrete_action_indicator_max_length
             )
             # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
             # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
             response_token_end = (
-                -self.config.discrete_action_max_length - self.config.discrete_action_indicator_max_length - 1
+                -advantage_length
+                - self.config.discrete_action_max_length
+                - self.config.discrete_action_indicator_max_length
+                - 1
             )
             response_slice_object = slice(response_token_start, response_token_end)
             response_out = prefix_out[
@@ -1549,6 +1667,52 @@ class PI05FlowMatching(nn.Module):
             out["CE_per_sample"] = ce_ps
         return out
 
+    @staticmethod
+    def _duplicate_cache(value):
+        """Duplicate every cache tensor along its batch axis for CFG."""
+        if isinstance(value, Tensor):
+            return torch.cat([value, value], dim=0)
+        if isinstance(value, dict):
+            return {key: PI05FlowMatching._duplicate_cache(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [PI05FlowMatching._duplicate_cache(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(PI05FlowMatching._duplicate_cache(item) for item in value)
+        return value
+
+    def _append_advantage_to_cache(
+        self,
+        prefix_pad_masks: Tensor,
+        past_key_values,
+        prefix_offsets: Tensor,
+        advantage_tokens: Tensor,
+        advantage_masks: Tensor,
+    ) -> tuple[Tensor, object]:
+        """Append the post-Response advantage block to an existing VLM cache."""
+        advantage_emb = self.paligemma_with_expert.embed_language_tokens(advantage_tokens)
+        advantage_emb = advantage_emb * math.sqrt(advantage_emb.shape[-1])
+        advantage_att_masks = torch.ones_like(advantage_masks, dtype=torch.bool)
+        previous_length = prefix_pad_masks.shape[1]
+        attention_mask = make_att_2d_masks(
+            advantage_masks,
+            advantage_att_masks,
+            n_cross_att_tokens=previous_length,
+            cross_att_pad_masks=prefix_pad_masks,
+        )
+        position_ids = prefix_offsets + torch.cumsum(advantage_masks, dim=1)
+        updated_pad_masks = torch.cat([prefix_pad_masks, advantage_masks], dim=1)
+
+        (_, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[advantage_emb, None],
+            n_cross_att_tokens=updated_pad_masks.shape[1],
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+        return updated_pad_masks, past_key_values
+
     def sample_actions(
         self,
         images: list[Tensor],
@@ -1559,6 +1723,7 @@ class PI05FlowMatching(nn.Module):
         delay: Tensor,
         noise: Tensor | None = None,
         state: Tensor | None = None,
+        advantage: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
 
@@ -1571,8 +1736,8 @@ class PI05FlowMatching(nn.Module):
             delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
             state: Optional continuous state tensor of shape (batch_size, max_state_dim).
-            indicator_tokens: Optional indicator token tensor.
-            indicator_masks: Optional indicator mask tensor.
+            advantage: Optional per-sample scalar advantage tensor. In ``use``
+                mode, omission falls back to the unconditioned path.
         Returns:
             The sampled action tensor.
         """
@@ -1634,6 +1799,29 @@ class PI05FlowMatching(nn.Module):
                     device,
                 )
 
+        advantage_tokens, advantage_masks = self.prepare_advantage_tokens(
+            advantage,
+            batch_size=bsize,
+            device=device,
+            apply_cfg_dropout=False,
+            inference=True,
+        )
+        use_cfg = advantage_tokens is not None and self.config.guidance_scale > 1.0
+        if advantage_tokens is not None:
+            if use_cfg:
+                prefix_pad_masks = torch.cat([prefix_pad_masks, prefix_pad_masks], dim=0)
+                prefix_offsets = torch.cat([prefix_offsets, prefix_offsets], dim=0)
+                past_key_values = self._duplicate_cache(past_key_values)
+                advantage_tokens = torch.cat([advantage_tokens, advantage_tokens], dim=0)
+                advantage_masks = torch.cat([advantage_masks, torch.zeros_like(advantage_masks)], dim=0)
+            prefix_pad_masks, past_key_values = self._append_advantage_to_cache(
+                prefix_pad_masks,
+                past_key_values,
+                prefix_offsets,
+                advantage_tokens,
+                advantage_masks,
+            )
+
         # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -1645,12 +1833,23 @@ class PI05FlowMatching(nn.Module):
             # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
             x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
             masked_time = torch.where(prefix_mask, 0, time)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                masked_time,
-            )
+            if use_cfg:
+                model_x_t = torch.cat([x_t, x_t], dim=0)
+                model_time = torch.cat([masked_time, masked_time], dim=0)
+                v_cond, v_uncond = self.denoise_step(
+                    prefix_pad_masks,
+                    past_key_values,
+                    model_x_t,
+                    model_time,
+                ).chunk(2, dim=0)
+                v_t = apply_classifier_free_guidance(v_cond, v_uncond, self.config.guidance_scale)
+            else:
+                v_t = self.denoise_step(
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    masked_time,
+                )
 
             # Euler step
             x_t += dt * v_t

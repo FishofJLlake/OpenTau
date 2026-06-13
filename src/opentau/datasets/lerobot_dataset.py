@@ -341,6 +341,20 @@ class VQADatasetMetadata(DatasetMetadata):
     pass
 
 
+def _compute_task_reward_normalizers(episodes, episode_lengths, episode_to_task_index):
+    """Return each task's maximum selected episode length."""
+    normalizers = {}
+    for episode_index in episodes:
+        task_index = episode_to_task_index.get(episode_index)
+        if task_index is None:
+            continue
+        normalizers[task_index] = max(
+            normalizers.get(task_index, 0),
+            episode_lengths[episode_index],
+        )
+    return normalizers
+
+
 class LeRobotDatasetMetadata(DatasetMetadata):
     """Metadata manager for LeRobot datasets with Hub integration and version handling.
 
@@ -446,6 +460,15 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             else:
                 self.episodes_stats = load_episodes_stats(self.root)
                 self.stats = aggregate_stats(list(self.episodes_stats.values()))
+                stored_stats = load_stats(self.root) or {}
+                for feature_name, feature_stats in stored_stats.items():
+                    quantile_stats = {
+                        stat_name: stat_value
+                        for stat_name, stat_value in feature_stats.items()
+                        if stat_name in {"q01", "q99"}
+                    }
+                    if quantile_stats:
+                        self.stats.setdefault(feature_name, {}).update(quantile_stats)
 
         self.advantages = load_advantages(self.root)
 
@@ -1592,7 +1615,18 @@ class LeRobotDataset(BaseDataset):
             self._episodes_were_specified = True
 
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
+            quantile_stats = {
+                feature_name: {
+                    stat_name: stat_value
+                    for stat_name, stat_value in feature_stats.items()
+                    if stat_name in {"q01", "q99"}
+                }
+                for feature_name, feature_stats in self.meta.stats.items()
+            }
             self.stats = aggregate_stats([self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes])
+            for feature_name, feature_stats in quantile_stats.items():
+                if feature_stats:
+                    self.stats.setdefault(feature_name, {}).update(feature_stats)
             # Propagate the selected-episode aggregate onto the metadata so the
             # mixture normalizer (which pools `ds.meta.stats`) reflects the
             # episodes actually trained on, not the full on-disk dataset.
@@ -1684,6 +1718,13 @@ class LeRobotDataset(BaseDataset):
             epi2idx=self.epi2idx,
             valid_task_indices=set(self.meta.task_to_task_index.values()),
         )
+        self.task_reward_normalizers: dict[int, int] = {}
+        if isinstance(self.cfg.policy, ValueConfig):
+            self.task_reward_normalizers = _compute_task_reward_normalizers(
+                self.episodes,
+                self.episode_lengths,
+                self.episode_to_task_index,
+            )
         self.speed_percentiles_by_task: dict[int, list[float] | None] = load_or_compute_speed_percentiles(
             root=self.root,
             episode_lengths=self.episode_lengths,
@@ -1732,6 +1773,12 @@ class LeRobotDataset(BaseDataset):
             for ep in self.episodes:
                 starts = self.segment_starts_by_episode[ep]
                 self.segment_memories_by_episode[ep] = [""] * len(starts)
+
+    def _get_reward_normalizer_for_task(self, task_idx: int) -> int:
+        """Return the selected task's maximum episode length, with config fallback."""
+        default = self.cfg.policy.reward_config.reward_normalizer
+        value = self.task_reward_normalizers.get(task_idx, default)
+        return value if value > 0 else default
 
     @on_accelerate_main_proc(local=True, _sync=True)
     def push_to_hub(
@@ -2417,6 +2464,7 @@ class LeRobotDataset(BaseDataset):
             episode_index = item["episode_index"].item()
             # don't convert to timestamp to `float`, because torch.float64 is not supported on MPS
             timestamp = item["timestamp"]
+            human_intervention = item.get("human_intervention", 0)
 
             # Attach raw optional fields (stripped to _raw suffix) so
             # BaseDataset._emit_optional_keys can apply dropout uniformly.
@@ -2451,11 +2499,12 @@ class LeRobotDataset(BaseDataset):
 
             # only add the below fields to item when training or evaluating the value fns
             if isinstance(self.cfg.policy, ValueConfig):
+                reward_normalizer = self._get_reward_normalizer_for_task(task_idx)
                 item["return_bin_idx"], item["return_continuous"] = calculate_return_bins_with_equal_width(
                     success,
                     self.cfg.policy.reward_config.number_of_bins,
                     ep_end,
-                    self.cfg.policy.reward_config.reward_normalizer,
+                    reward_normalizer,
                     idx,
                     self.cfg.policy.reward_config.C_neg,
                 )
@@ -2470,6 +2519,8 @@ class LeRobotDataset(BaseDataset):
                     item["last_step"] = idx + self.cfg.policy.reward_config.N_steps_look_ahead >= ep_end
                     item["episode_index"] = episode_index
                     item["timestamp"] = timestamp
+                    item["reward_normalizer"] = torch.tensor(reward_normalizer, dtype=torch.long)
+                    item["human_intervention"] = torch.as_tensor(human_intervention, dtype=torch.int32)
             else:
                 item["return_bin_idx"] = torch.tensor(0, dtype=torch.long)
                 item["return_continuous"] = torch.tensor(0, dtype=torch.float32)
@@ -2541,6 +2592,10 @@ class LeRobotDataset(BaseDataset):
         for name in frame:
             if isinstance(frame[name], torch.Tensor):
                 frame[name] = frame[name].numpy()
+
+        if "human_intervention" in self.features and "human_intervention" not in frame:
+            feature = self.features["human_intervention"]
+            frame["human_intervention"] = np.zeros(feature["shape"], dtype=np.dtype(feature["dtype"]))
 
         deferred = getattr(self, "deferred_video_keys", set())
         validate_frame(frame, self.features, deferred_features=deferred or None)

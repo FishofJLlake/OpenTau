@@ -264,6 +264,13 @@ def create_stats_buffers(
             stat_names = ("mean", "std")
         elif norm_mode is NormalizationMode.MIN_MAX:
             stat_names = ("min", "max")
+        elif norm_mode is NormalizationMode.QUANTILE:
+            if ft.type not in (FeatureType.STATE, FeatureType.ACTION):
+                raise ValueError(
+                    "NormalizationMode.QUANTILE only supports STATE and ACTION features, "
+                    f"but feature {key!r} has type {ft.type}."
+                )
+            stat_names = ("q01", "q99")
         else:
             raise ValueError(norm_mode)
 
@@ -281,9 +288,15 @@ def create_stats_buffers(
                             f"Available keys: {list(ds_stats)}."
                         )
                     if name not in ds_stats[key]:
+                        quantile_hint = (
+                            " Run `python -m opentau.scripts.compute_quantiles "
+                            "--config_path=<training-config>` first."
+                            if name in {"q01", "q99"}
+                            else ""
+                        )
                         raise KeyError(
                             f"per_dataset_stats[{i}]['{key}'] is missing stat '{name}'. "
-                            f"Available stats: {list(ds_stats[key])}."
+                            f"Available stats: {list(ds_stats[key])}.{quantile_hint}"
                         )
                     row = _stat_to_float32_tensor(ds_stats[key][name])
                     if tuple(row.shape) != shape:
@@ -414,6 +427,11 @@ class Normalize(nn.Module):
                 if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
                     active = True
                     break
+            elif norm_mode is NormalizationMode.QUANTILE:
+                rng = _materialize(buffer["q99"]) - _materialize(buffer["q01"])
+                if bool((torch.isfinite(rng) & (rng.abs() < EPS)).any()):
+                    active = True
+                    break
         self._snap_active = active
         return active
 
@@ -479,6 +497,21 @@ class Normalize(nn.Module):
                 batch[key] = deviation / (denom + EPS)
                 # normalize to [-1, 1]
                 batch[key] = batch[key] * 2 - 1
+                if (
+                    _SNAP_WARN_TOL > 0
+                    and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
+                    and self._snapping_possible()
+                ):
+                    _warn_snapped_deviation(key, denom_is_zero, deviation, dataset_index, self.dataset_names)
+            elif norm_mode is NormalizationMode.QUANTILE:
+                q01 = _gather_and_broadcast(_materialize(buffer["q01"]), dataset_index, batch_val)
+                q99 = _gather_and_broadcast(_materialize(buffer["q99"]), dataset_index, batch_val)
+                assert not torch.isinf(q01).any(), _no_stats_error_str("q01")
+                assert not torch.isinf(q99).any(), _no_stats_error_str("q99")
+                denom = q99 - q01
+                denom_is_zero = denom.abs() < EPS
+                deviation = batch_val - q01
+                batch[key] = deviation / (denom + EPS) * 2 - 1
                 if (
                     _SNAP_WARN_TOL > 0
                     and not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export())
@@ -567,6 +600,15 @@ class Unnormalize(nn.Module):
                 denom = torch.where(denom.abs() < EPS, torch.ones_like(denom), denom)
                 batch[key] = (batch_val + 1) / 2
                 batch[key] = batch[key] * (denom + EPS) + min_
+            elif norm_mode is NormalizationMode.QUANTILE:
+                q01 = _gather_and_broadcast(_materialize(buffer["q01"]), dataset_index, batch_val)
+                q99 = _gather_and_broadcast(_materialize(buffer["q99"]), dataset_index, batch_val)
+                if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
+                    assert not torch.isinf(q01).any(), _no_stats_error_str("q01")
+                    assert not torch.isinf(q99).any(), _no_stats_error_str("q99")
+                denom = q99 - q01
+                batch[key] = (batch_val + 1) / 2
+                batch[key] = batch[key] * (denom + EPS) + q01
             else:
                 raise ValueError(norm_mode)
         return batch

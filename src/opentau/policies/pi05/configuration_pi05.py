@@ -134,6 +134,12 @@ class PI05Config(PreTrainedConfig):
     # Decoding
     num_steps: int = 10
 
+    # Advantage conditioning / classifier-free guidance.
+    advantage: Literal["ignore", "on", "use"] = "ignore"
+    advantage_threshold: float = 0.0
+    cfg_dropout: float = 0.3
+    guidance_scale: float = 1.0
+
     # Real Time Inference
     # maximum number of frozen actions
     max_delay: int = 0
@@ -195,6 +201,19 @@ class PI05Config(PreTrainedConfig):
         if self.max_delay > self.chunk_size:
             raise ValueError(
                 f"The max delay must be less than or equal to the chunk size. Got {self.max_delay} for `max_delay` and {self.chunk_size} for `chunk_size`."
+            )
+
+        if self.advantage not in ("ignore", "on", "use"):
+            raise ValueError(f"advantage must be one of 'ignore', 'on', or 'use', got {self.advantage!r}.")
+        if not 0.0 <= self.cfg_dropout < 1.0:
+            raise ValueError(f"cfg_dropout must be in [0, 1), got {self.cfg_dropout}.")
+        if self.guidance_scale < 1.0:
+            raise ValueError(f"guidance_scale must be >= 1, got {self.guidance_scale}.")
+        if self.advantage == "ignore" and self.guidance_scale > 1.0:
+            warnings.warn(
+                "guidance_scale has no effect when advantage='ignore'; inference will use one branch.",
+                UserWarning,
+                stacklevel=2,
             )
 
         if self.n_action_steps < self.chunk_size and self.max_delay != 0:

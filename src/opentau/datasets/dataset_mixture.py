@@ -75,6 +75,7 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 from opentau.configs.train import TrainPipelineConfig
+from opentau.configs.types import FeatureType, NormalizationMode
 from opentau.datasets.compute_stats import aggregate_stats
 from opentau.datasets.lerobot_dataset import BaseDataset, DatasetMetadata
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, feature_mapping_key
@@ -134,12 +135,13 @@ class _TaggedDataset(Dataset):
         return item
 
 
-def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
-    """Pad the last dimension of a vector to a target size with zeros.
+def pad_vector(vector: np.ndarray, new_dim: int, fill_value: float = 0.0) -> np.ndarray:
+    """Pad the last dimension of a vector to a target size.
 
     Args:
         vector: Input numpy array to pad.
         new_dim: Target size for the last dimension.
+        fill_value: Value assigned to padded dimensions.
 
     Returns:
         Padded array with the last dimension expanded to new_dim. If the
@@ -150,7 +152,7 @@ def pad_vector(vector: np.ndarray, new_dim: int) -> np.ndarray:
     shape = list(vector.shape)
     current_dim = shape[-1]
     shape[-1] = new_dim
-    new_vector = np.zeros(shape, dtype=vector.dtype)
+    new_vector = np.full(shape, fill_value, dtype=vector.dtype)
     new_vector[..., :current_dim] = vector
     return new_vector
 
@@ -340,9 +342,20 @@ class DatasetMixtureMetadata:
         """
         per_dataset_norm_keys: list[str] = []
         fallback_dataset_names: list[str] = []
+        policy = getattr(self.cfg, "policy", None)
+        norm_map = policy.normalization_mapping if policy is not None else {}
+        quantile_enabled = any(
+            norm_map.get(feature_type.value) == NormalizationMode.QUANTILE
+            for feature_type in (FeatureType.STATE, FeatureType.ACTION)
+        )
         for ds_name, meta in zip(self.dataset_names, metadatas, strict=True):
-            info = getattr(meta, "info", {}) or {}
-            key, fallback_fired = compute_norm_key(info.get("robot_type"), info.get("control_mode"), ds_name)
+            if quantile_enabled:
+                key, fallback_fired = ds_name, False
+            else:
+                info = getattr(meta, "info", {}) or {}
+                key, fallback_fired = compute_norm_key(
+                    info.get("robot_type"), info.get("control_mode"), ds_name
+                )
             per_dataset_norm_keys.append(key)
             if fallback_fired:
                 fallback_dataset_names.append(ds_name)
@@ -519,12 +532,13 @@ class DatasetMixtureMetadata:
 
         # pad state and action vectors
         for stat in standard_stats["state"]:
-            if stat in ["mean", "std", "min", "max"]:
+            if stat in ["mean", "std", "min", "max", "q01", "q99"]:
+                fill_value = -1.0 if stat == "q01" else 1.0 if stat == "q99" else 0.0
                 standard_stats["state"][stat] = pad_vector(
-                    standard_stats["state"][stat], self.cfg.max_state_dim
+                    standard_stats["state"][stat], self.cfg.max_state_dim, fill_value=fill_value
                 )
                 standard_stats["actions"][stat] = pad_vector(
-                    standard_stats["actions"][stat], self.cfg.max_action_dim
+                    standard_stats["actions"][stat], self.cfg.max_action_dim, fill_value=fill_value
                 )
 
         # pad missing cameras

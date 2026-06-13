@@ -196,6 +196,15 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
+    "zoomlion/realman_dualarm": {
+        "camera0": "observation.images.head",
+        "camera1": "observation.images.left",
+        "camera2": "observation.images.right",
+        "state": "observation.state",
+        "actions": "action",
+        "prompt": "task",
+        "response": "response",
+    },
     "dummy": {
         "camera0": "image",
         "state": "state",

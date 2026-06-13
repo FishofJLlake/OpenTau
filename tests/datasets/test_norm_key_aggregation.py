@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from opentau.configs.types import NormalizationMode
 from opentau.datasets.dataset_mixture import DatasetMixtureMetadata, compute_norm_key
 from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 
@@ -103,6 +104,8 @@ def _make_stats(state_dim: int, action_dim: int, *, value: float, count: int) ->
             "min": np.full((state_dim,), float(value) - 1.0, dtype=np.float32),
             "max": np.full((state_dim,), float(value) + 1.0, dtype=np.float32),
             "count": np.array([count], dtype=np.int64),
+            "q01": np.full((state_dim,), float(value) - 0.9, dtype=np.float32),
+            "q99": np.full((state_dim,), float(value) + 0.9, dtype=np.float32),
         },
         "actions": {
             "mean": np.full((action_dim,), float(value) * 2.0, dtype=np.float32),
@@ -110,6 +113,8 @@ def _make_stats(state_dim: int, action_dim: int, *, value: float, count: int) ->
             "min": np.full((action_dim,), float(value) - 1.0, dtype=np.float32),
             "max": np.full((action_dim,), float(value) + 1.0, dtype=np.float32),
             "count": np.array([count], dtype=np.int64),
+            "q01": np.full((action_dim,), float(value) - 0.9, dtype=np.float32),
+            "q99": np.full((action_dim,), float(value) + 0.9, dtype=np.float32),
         },
         "camera0": {
             "mean": np.full((3, 1, 1), float(value) * 0.01, dtype=np.float32),
@@ -195,6 +200,37 @@ class TestDatasetMixtureMetadataNormAggregation:
         assert set(meta.norm_keys) == {"franka::joint", "franka::ee"}
         assert meta.dataset_to_norm_index["repo/a"] != meta.dataset_to_norm_index["repo/b"]
         assert len(meta.per_norm_key_stats) == 2
+
+    def test_quantile_mode_forces_private_dataset_heads(self):
+        _patch_name_mapping(["repo/a", "repo/b"])
+        cfg = _make_cfg()
+        cfg.policy = SimpleNamespace(
+            normalization_mapping={
+                "STATE": NormalizationMode.QUANTILE,
+                "ACTION": NormalizationMode.QUANTILE,
+            }
+        )
+        m1 = _make_metadata(
+            "repo/a",
+            info={"robot_type": "franka", "control_mode": "joint", "total_frames": 100},
+            stats=_make_stats(6, 7, value=1.0, count=100),
+        )
+        m2 = _make_metadata(
+            "repo/b",
+            info={"robot_type": "franka", "control_mode": "joint", "total_frames": 200},
+            stats=_make_stats(6, 7, value=3.0, count=200),
+        )
+        meta = DatasetMixtureMetadata(
+            cfg, [m1, m2], dataset_weights=[0.5, 0.5], dataset_names=["repo/a", "repo/b"]
+        )
+        assert meta.norm_keys == ["repo/a", "repo/b"]
+        assert meta.dataset_to_norm_index == {"repo/a": 0, "repo/b": 1}
+        np.testing.assert_allclose(meta.per_norm_key_stats[0]["state"]["q01"][:6], 0.1)
+        np.testing.assert_allclose(meta.per_norm_key_stats[1]["state"]["q01"][:6], 2.1)
+        np.testing.assert_allclose(meta.per_norm_key_stats[0]["state"]["q01"][6:], -1.0)
+        np.testing.assert_allclose(meta.per_norm_key_stats[0]["state"]["q99"][6:], 1.0)
+        np.testing.assert_allclose(meta.per_norm_key_stats[0]["actions"]["q01"][7:], -1.0)
+        np.testing.assert_allclose(meta.per_norm_key_stats[0]["actions"]["q99"][7:], 1.0)
 
     def test_missing_robot_type_falls_back_with_single_warning(self, caplog):
         _patch_name_mapping(["repo/a", "repo/b"])

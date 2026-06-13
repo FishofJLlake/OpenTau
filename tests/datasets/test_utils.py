@@ -17,6 +17,7 @@
 
 import logging
 
+import numpy as np
 import pytest
 import torch
 from datasets import Dataset
@@ -28,6 +29,9 @@ from opentau.datasets.utils import (
     check_version_compatibility,
     create_lerobot_dataset_card,
     hf_transform_to_torch,
+    load_stats,
+    write_quantile_stats,
+    write_stats,
 )
 
 
@@ -62,6 +66,32 @@ def test_calculate_episode_data_index():
     episode_data_index = calculate_episode_data_index(dataset)
     assert torch.equal(episode_data_index["from"], torch.tensor([0, 2, 3]))
     assert torch.equal(episode_data_index["to"], torch.tensor([2, 3, 6]))
+
+
+def test_load_stats_merges_quantile_file(tmp_path):
+    write_stats({"state": {"mean": np.array([1.0]), "std": np.array([2.0])}}, tmp_path)
+    write_quantile_stats(
+        {"state": {"q01": np.array([-1.0]), "q99": np.array([3.0])}},
+        tmp_path,
+    )
+
+    stats = load_stats(tmp_path)
+
+    np.testing.assert_array_equal(stats["state"]["mean"], [1.0])
+    np.testing.assert_array_equal(stats["state"]["q01"], [-1.0])
+    np.testing.assert_array_equal(stats["state"]["q99"], [3.0])
+
+
+def test_load_stats_accepts_quantile_only_file(tmp_path):
+    write_quantile_stats(
+        {"actions": {"q01": np.array([-2.0]), "q99": np.array([4.0])}},
+        tmp_path,
+    )
+
+    stats = load_stats(tmp_path)
+
+    np.testing.assert_array_equal(stats["actions"]["q01"], [-2.0])
+    np.testing.assert_array_equal(stats["actions"]["q99"], [4.0])
 
 
 @pytest.fixture

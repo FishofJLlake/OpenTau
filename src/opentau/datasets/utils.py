@@ -109,9 +109,12 @@ from opentau.utils.utils import is_valid_numpy_dtype_string
 DEFAULT_CHUNK_SIZE = 1000  # Max number of episodes per chunk
 
 ADVANTAGES_PATH = "meta/advantages.json"
+RAW_ADVANTAGES_PATH = "meta/raw_advantages.json"
+ADVANTAGE_SOURCES_PATH = "meta/advantage_sources.json"
 INFO_PATH = "meta/info.json"
 EPISODES_PATH = "meta/episodes.jsonl"
 STATS_PATH = "meta/stats.json"
+QUANTILE_STATS_PATH = "meta/stats_quantiles.json"
 EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
 TASKS_PATH = "meta/tasks.jsonl"
 
@@ -411,6 +414,12 @@ def write_stats(stats: dict, local_dir: Path) -> None:
     write_json(serialized_stats, local_dir / STATS_PATH)
 
 
+def write_quantile_stats(stats: dict, local_dir: Path) -> None:
+    """Write q01/q99 statistics without replacing the standard stats file."""
+    serialized_stats = serialize_dict(stats)
+    write_json(serialized_stats, local_dir / QUANTILE_STATS_PATH)
+
+
 def cast_stats_to_numpy(stats) -> dict[str, dict[str, np.ndarray]]:
     """Convert statistics dictionary values to numpy arrays.
 
@@ -428,18 +437,22 @@ def cast_stats_to_numpy(stats) -> dict[str, dict[str, np.ndarray]]:
 
 
 def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]] | None:
-    """Load dataset statistics from the standard stats.json file.
+    """Load standard statistics and merge optional q01/q99 statistics.
 
     Args:
         local_dir: Root directory of the dataset containing meta/stats.json.
 
     Returns:
-        Dictionary with statistics as numpy arrays, or None if the file doesn't exist.
+        Dictionary with statistics as numpy arrays, or None if neither file exists.
     """
-    if not (local_dir / STATS_PATH).exists():
-        return None
-    stats = load_json(local_dir / STATS_PATH)
-    return cast_stats_to_numpy(stats)
+    stats_path = local_dir / STATS_PATH
+    stats = cast_stats_to_numpy(load_json(stats_path)) if stats_path.exists() else {}
+    quantile_path = local_dir / QUANTILE_STATS_PATH
+    if quantile_path.exists():
+        quantile_stats = cast_stats_to_numpy(load_json(quantile_path))
+        for feature_name, feature_stats in quantile_stats.items():
+            stats.setdefault(feature_name, {}).update(feature_stats)
+    return stats or None
 
 
 def load_advantages(local_dir: Path) -> dict | None:
